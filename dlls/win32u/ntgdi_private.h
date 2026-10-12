@@ -272,6 +272,9 @@ struct gdi_font
     OUTLINETEXTMETRICW     otm;
     KERNINGPAIR           *kern_pairs;
     int                    kern_count;
+    UINT                   render_scale;   /* raster scale of the render font request below */
+    INT                    render_height;  /* lfHeight of the render font request */
+    INT                    render_width;   /* lfWidth of the render font request */
     /* the following members can be accessed without locking, they are never modified after creation */
     void                  *private;  /* font backend private data */
     struct list            child_fonts;
@@ -356,6 +359,9 @@ extern int add_gdi_face( const WCHAR *family_name, const WCHAR *second_name,
                          const struct bitmap_font_size *size );
 extern UINT font_init(void);
 extern const struct font_backend_funcs *init_freetype_lib(void);
+extern BOOL dc_has_render_font( DC *dc );
+extern DWORD get_render_glyph_outline( DC *dc, UINT glyph, UINT format, GLYPHMETRICS *gm,
+                                       DWORD buflen, void *buf );
 
 /* opentype.c */
 
