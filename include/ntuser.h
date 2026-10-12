@@ -1123,6 +1123,7 @@ enum
     NtUserCallOneParam_SetThreadDpiAwarenessContext,
     NtUserCallOneParam_D3DKMTOpenAdapterFromGdiDisplayName,
     NtUserCallOneParam_GetAsyncKeyboardState,
+    NtUserCallOneParam_SetDefaultProcessDpiAwarenessContext,
     /* temporary exports */
     NtUserGetDeskPattern,
 };
@@ -1201,6 +1202,11 @@ static inline NTSTATUS NtUserD3DKMTOpenAdapterFromGdiDisplayName( D3DKMT_OPENADA
 static inline BOOL NtUserGetAsyncKeyboardState( BYTE state[256] )
 {
     return NtUserCallOneParam( (UINT_PTR)state, NtUserCallOneParam_GetAsyncKeyboardState );
+}
+
+static inline BOOL NtUserSetDefaultProcessDpiAwarenessContext( UINT context )
+{
+    return NtUserCallOneParam( context, NtUserCallOneParam_SetDefaultProcessDpiAwarenessContext );
 }
 
 /* NtUserCallTwoParam codes, not compatible with Windows */
