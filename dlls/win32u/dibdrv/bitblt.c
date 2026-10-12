@@ -1408,9 +1408,11 @@ BOOL dibdrv_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
                         PHYSDEV src_dev, struct bitblt_coords *src, DWORD rop )
 {
     DC *dc_dst = get_physdev_dc( dst_dev );
+    int dst_scale = dc_dst->gdi_scale, src_scale = get_physdev_dc( src_dev )->gdi_scale;
 
-    if (dst->width == 1 && src->width > 1) src->width--;
-    if (dst->height == 1 && src->height > 1) src->height--;
+    /* the coordinates are in raster pixels, but the size check is done in device pixels */
+    if (dst->width == dst_scale && src->width > src_scale) src->width -= src_scale;
+    if (dst->height == dst_scale && src->height > src_scale) src->height -= src_scale;
 
     return dc_dst->nulldrv.funcs->pStretchBlt( &dc_dst->nulldrv, dst, src_dev, src, rop );
 }

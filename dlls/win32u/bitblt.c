@@ -40,7 +40,7 @@ static inline BOOL rop_uses_src( DWORD rop )
     return ((rop >> 2) & 0x330000) != (rop & 0x330000);
 }
 
-BOOL intersect_vis_rectangles( struct bitblt_coords *dst, struct bitblt_coords *src )
+BOOL intersect_vis_rectangles( struct bitblt_coords *dst, struct bitblt_coords *src, UINT src_scale )
 {
     RECT rect;
 
@@ -67,16 +67,20 @@ BOOL intersect_vis_rectangles( struct bitblt_coords *dst, struct bitblt_coords *
         order_rect( &rect );
 
         /* when the source rectangle needs to flip and it doesn't fit in the source device
-           area, the destination area isn't flipped. So, adjust destination coordinates */
+           area, the destination area isn't flipped. So, adjust destination coordinates.
+           A flipped source with a GDI scaling factor starts on the last raster pixel of a
+           device pixel, use the first one so that the overflow is checked in device pixels */
         if (src->width < 0 && dst->width > 0 &&
-            (src->x + src->width + 1 < src->visrect.left || src->x > src->visrect.right))
+            (src->x + src->width + 1 < src->visrect.left ||
+             src->x - ((int)src_scale - 1) > src->visrect.right))
             dst->x += (dst->width - rect.right) - rect.left;
         else if (src->width > 0 && dst->width < 0 &&
                  (src->x < src->visrect.left || src->x + src->width > src->visrect.right))
             dst->x -= rect.right - (dst->width - rect.left);
 
         if (src->height < 0 && dst->height > 0 &&
-            (src->y + src->height + 1 < src->visrect.top || src->y > src->visrect.bottom))
+            (src->y + src->height + 1 < src->visrect.top ||
+             src->y - ((int)src_scale - 1) > src->visrect.bottom))
             dst->y += (dst->height - rect.bottom) - rect.top;
         else if (src->height > 0 && dst->height < 0 &&
                  (src->y < src->visrect.top || src->y + src->height > src->visrect.bottom))
@@ -133,6 +137,7 @@ static BOOL get_vis_rectangles( DC *dc_dst, struct bitblt_coords *dst,
         dst->x += dst->width;
         dst->width = -dst->width;
     }
+    scale_bitblt_coords( dst, dc_dst->gdi_scale );
     get_bounding_rect( &rect, dst->x, dst->y, dst->width, dst->height );
 
     clip_visrect( dc_dst, &dst->visrect, &rect );
@@ -155,12 +160,13 @@ static BOOL get_vis_rectangles( DC *dc_dst, struct bitblt_coords *dst,
         src->x += src->width;
         src->width = -src->width;
     }
+    scale_bitblt_coords( src, dc_src->gdi_scale );
     get_bounding_rect( &rect, src->x, src->y, src->width, src->height );
 
     if (!clip_device_rect( dc_src, &src->visrect, &rect )) return FALSE;
     if (IsRectEmpty( &dst->visrect )) return FALSE;
 
-    return intersect_vis_rectangles( dst, src );
+    return intersect_vis_rectangles( dst, src, dc_src->gdi_scale );
 }
 
 void free_heap_bits( struct gdi_image_bits *bits )
@@ -270,6 +276,27 @@ void get_mono_dc_colors( DC *dc, int color_table_size, BITMAPINFO *info, int cou
     info->bmiHeader.biClrUsed = count;
 }
 
+/* A blit between DCs with different GDI scaling factors is a stretch in raster coordinates.
+ * Check whether it has the same size in device units, i.e. whether it is a copy that is only
+ * stretched by the scaling factors, mirrored or not depending on allow_mirror. */
+static BOOL is_scaled_copy( DC *dc_dst, const struct bitblt_coords *dst,
+                            DC *dc_src, const struct bitblt_coords *src, BOOL allow_mirror )
+{
+    LONGLONG dst_width = dst->width, dst_height = dst->height;
+    LONGLONG src_width = src->width, src_height = src->height;
+
+    if (dc_dst->gdi_scale == dc_src->gdi_scale) return FALSE;
+    if (allow_mirror)
+    {
+        dst_width = abs( dst->width );
+        dst_height = abs( dst->height );
+        src_width = abs( src->width );
+        src_height = abs( src->height );
+    }
+    return dst_width * dc_src->gdi_scale == src_width * dc_dst->gdi_scale &&
+           dst_height * dc_src->gdi_scale == src_height * dc_dst->gdi_scale;
+}
+
 /***********************************************************************
  *           null driver fallback implementations
  */
@@ -316,9 +343,18 @@ BOOL nulldrv_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
     if (err == ERROR_TRANSFORM_NOT_SUPPORTED &&
         ((src->width != dst->width) || (src->height != dst->height)))
     {
+        int mode = dc_dst->attr->stretch_blt_mode;
+
+        /* a stretch that only comes from the scaling factors uses nearest neighbor so that
+         * pixels are replicated or sampled exactly */
+        if (is_scaled_copy( dc_dst, dst, dc_src, src, TRUE )) mode = COLORONCOLOR;
         copy_bitmapinfo( src_info, dst_info );
-        err = stretch_bits( src_info, src, dst_info, dst, &bits, dc_dst->attr->stretch_blt_mode );
+        err = stretch_bits( src_info, src, dst_info, dst, &bits, mode );
         if (!err) err = dst_dev->funcs->pPutImage( dst_dev, 0, dst_info, &bits, src, dst, rop );
+        /* the visible rectangles of a stretch have rounding margins, which may leave
+         * nothing to copy when the exact intersection of an unmirrored copy is empty */
+        else if (err == ERROR_NO_DATA && is_scaled_copy( dc_dst, dst, dc_src, src, FALSE ))
+            err = ERROR_SUCCESS;
     }
 
     if (bits.free) bits.free( &bits );
@@ -434,7 +470,7 @@ BOOL nulldrv_GradientFill( PHYSDEV dev, TRIVERTEX *vert_array, ULONG nvert,
         pts[i].x = vert_array[i].x;
         pts[i].y = vert_array[i].y;
     }
-    lp_to_dp( dc, pts, nvert );
+    lp_to_rp( dc, pts, nvert );
 
     /* compute bounding rect of all the rectangles/triangles */
     reset_bounds( &dst.visrect );
@@ -510,7 +546,7 @@ COLORREF nulldrv_GetPixel( PHYSDEV dev, INT x, INT y )
 
     src.visrect.left = x;
     src.visrect.top  = y;
-    lp_to_dp( dc, (POINT *)&src.visrect, 1 );
+    lp_to_rp_pixel( dc, (POINT *)&src.visrect );
     src.visrect.right  = src.visrect.left + 1;
     src.visrect.bottom = src.visrect.top + 1;
     src.x = src.visrect.left;
@@ -969,6 +1005,7 @@ BOOL WINAPI NtGdiAlphaBlend( HDC hdcDst, int xDst, int yDst, int widthDst, int h
     if ((dcDst = get_dc_ptr( hdcDst )))
     {
         struct bitblt_coords src, dst;
+        RECT src_rect;
 
         update_dc( dcSrc );
         update_dc( dcDst );
@@ -995,9 +1032,8 @@ BOOL WINAPI NtGdiAlphaBlend( HDC hdcDst, int xDst, int yDst, int widthDst, int h
 
         if (src.x < 0 || src.y < 0 || src.width < 0 || src.height < 0 ||
             src.log_width < 0 || src.log_height < 0 ||
-            (!IsRectEmpty( &dcSrc->device_rect ) &&
-             (src.width > dcSrc->device_rect.right - dcSrc->attr->vis_rect.left - src.x ||
-              src.height > dcSrc->device_rect.bottom - dcSrc->attr->vis_rect.top - src.y)))
+            (get_dc_raster_device_rect( dcSrc, &src_rect ) &&
+             (src.width > src_rect.right - src.x || src.height > src_rect.bottom - src.y)))
         {
             WARN( "Invalid src coords: (%d,%d), size %dx%d\n", src.x, src.y, src.width, src.height );
             RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );

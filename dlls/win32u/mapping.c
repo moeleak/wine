@@ -298,6 +298,19 @@ void lp_to_rp( DC *dc, POINT *points, INT count )
     }
 }
 
+/***********************************************************************
+ *           lp_to_rp_pixel
+ *
+ * Map a logical point to the raster pixel that is read back for its device pixel.
+ * That's the one kept by the nearest neighbor shrink of a blit from raster to device
+ * coordinates: the last column and the first row of the scaled device pixel.
+ */
+void lp_to_rp_pixel( DC *dc, POINT *pt )
+{
+    lp_to_rp( dc, pt, 1 );
+    pt->x += (int)dc->gdi_scale - 1;
+}
+
 
 /***********************************************************************
  *           NtGdiComputeXformCoefficients    (win32u.@)

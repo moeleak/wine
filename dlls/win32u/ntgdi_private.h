@@ -151,7 +151,7 @@ static inline BOOL is_bitmapobj_dib( const BITMAPOBJ *bmp )
 /* bitblt.c */
 extern DWORD convert_bits( const BITMAPINFO *src_info, struct bitblt_coords *src,
                            BITMAPINFO *dst_info, struct gdi_image_bits *bits );
-extern BOOL intersect_vis_rectangles( struct bitblt_coords *dst, struct bitblt_coords *src );
+extern BOOL intersect_vis_rectangles( struct bitblt_coords *dst, struct bitblt_coords *src, UINT src_scale );
 extern DWORD stretch_bits( const BITMAPINFO *src_info, struct bitblt_coords *src,
                            BITMAPINFO *dst_info, struct bitblt_coords *dst,
                            struct gdi_image_bits *bits, int mode );
@@ -402,6 +402,7 @@ extern void make_gdi_object_system( HGDIOBJ handle, BOOL set );
 extern BOOL dp_to_lp( DC *dc, POINT *points, INT count );
 extern void lp_to_dp( DC *dc, POINT *points, INT count );
 extern void lp_to_rp( DC *dc, POINT *points, INT count );
+extern void lp_to_rp_pixel( DC *dc, POINT *pt );
 extern BOOL set_map_mode( DC *dc, int mode );
 extern void combine_transform( XFORM *result, const XFORM *xform1,
                                const XFORM *xform2 );
