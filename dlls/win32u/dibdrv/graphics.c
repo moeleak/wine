@@ -67,11 +67,12 @@ static BOOL brush_rect( dibdrv_physdev *pdev, dib_brush *brush, const RECT *rect
 {
     DC *dc = get_physdev_dc( &pdev->dev );
     struct clipped_rects clipped_rects;
+    POINT brush_org;
     BOOL ret;
 
     if (!get_clipped_rects( &pdev->dib, rect, clip, &clipped_rects )) return TRUE;
     ret = brush->rects( pdev, brush, &pdev->dib, clipped_rects.count, clipped_rects.rects,
-                        &dc->attr->brush_org, dc->attr->rop_mode );
+                        get_raster_brush_org( dc, &brush_org ), dc->attr->rop_mode );
     free_clipped_rects( &clipped_rects );
     return ret;
 }
@@ -90,6 +91,7 @@ static BOOL pen_region( dibdrv_physdev *pdev, HRGN region )
     return brush_rect( pdev, &pdev->pen_brush, NULL, region );
 }
 
+/* the returned rectangle is in raster coordinates */
 static RECT get_device_rect( DC *dc, int left, int top, int right, int bottom, BOOL rtl_correction )
 {
     RECT rect;
@@ -105,7 +107,7 @@ static RECT get_device_rect( DC *dc, int left, int top, int right, int bottom, B
         rect.left--;
         rect.right--;
     }
-    lp_to_dp( dc, (POINT *)&rect, 2 );
+    lp_to_rp( dc, (POINT *)&rect, 2 );
     order_rect( &rect );
     return rect;
 }
@@ -118,10 +120,13 @@ static BOOL get_pen_device_rect( DC *dc, dibdrv_physdev *dev, RECT *rect,
 
     if (dev->pen_style == PS_INSIDEFRAME)
     {
-        rect->left   += dev->pen_width / 2;
-        rect->top    += dev->pen_width / 2;
-        rect->right  -= (dev->pen_width - 1) / 2;
-        rect->bottom -= (dev->pen_width - 1) / 2;
+        /* the inset is computed in device pixels */
+        int width = dev->pen_device_width, scale = dev->pen_scale;
+
+        rect->left   += scale * (width / 2);
+        rect->top    += scale * (width / 2);
+        rect->right  -= scale * ((width - 1) / 2);
+        rect->bottom -= scale * ((width - 1) / 2);
     }
     return TRUE;
 }
@@ -331,7 +336,7 @@ static BOOL draw_arc( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
     pt[0].y = start_y;
     pt[1].x = end_x;
     pt[1].y = end_y;
-    lp_to_dp( dc, pt, 2 );
+    lp_to_rp( dc, pt, 2 );
     /* make them relative to the ellipse center */
     pt[0].x -= rect.left + width / 2;
     pt[0].y -= rect.top + height / 2;
@@ -344,7 +349,7 @@ static BOOL draw_arc( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
     if (extra_lines == -1)
     {
         points[0] = dc->attr->cur_pos;
-        lp_to_dp( dc, points, 1 );
+        lp_to_rp( dc, points, 1 );
         count = 1 + get_arc_points( dc->attr->arc_direction, &rect, pt[0], pt[1], points + 1 );
     }
     else count = get_arc_points( dc->attr->arc_direction, &rect, pt[0], pt[1], points );
@@ -419,6 +424,17 @@ static BOOL stroke_and_fill_path( dibdrv_physdev *dev, BOOL stroke, BOOL fill )
 
     if (!(path = get_gdi_flat_path( dc, fill ? &interior : NULL ))) return FALSE;
     if (!(total = get_gdi_path_data( path, &points, &types ))) goto done;
+
+    if (dc->gdi_scale > 1)
+    {
+        /* the path is in device coordinates, and the flattened path is our own copy */
+        for (i = 0; i < total; i++)
+        {
+            points[i].x = scale_device_coord( points[i].x, dc->gdi_scale );
+            points[i].y = scale_device_coord( points[i].y, dc->gdi_scale );
+        }
+        if (interior) scale_region( interior, interior, dc->gdi_scale );
+    }
 
     if (stroke && dev->pen_uses_region) outline = NtGdiCreateRectRgn( 0, 0, 0, 0 );
 
@@ -1058,6 +1074,13 @@ BOOL dibdrv_ExtFloodFill( PHYSDEV dev, INT x, INT y, COLORREF color, UINT type )
 
     TRACE( "(%p, %d, %d, %s, %d)\n", pdev, x, y, debugstr_color(color), type );
 
+    if (dc->gdi_scale > 1)
+    {
+        /* start from the raster pixel that GetPixel reads back for this device pixel */
+        x = scale_device_coord( x, dc->gdi_scale ) + (int)dc->gdi_scale - 1;
+        y = scale_device_coord( y, dc->gdi_scale );
+    }
+
     if (x < 0 || x >= pdev->dib.rect.right - pdev->dib.rect.left ||
         y < 0 || y >= pdev->dib.rect.bottom - pdev->dib.rect.top) return FALSE;
 
@@ -1118,7 +1141,7 @@ COLORREF dibdrv_GetPixel( PHYSDEV dev, INT x, INT y )
 
     pt.x = x;
     pt.y = y;
-    lp_to_dp( dc, &pt, 1 );
+    lp_to_rp_pixel( dc, &pt );
     rect.left = pt.x;
     rect.top =  pt.y;
     rect.right = rect.left + 1;
@@ -1144,7 +1167,7 @@ BOOL dibdrv_LineTo( PHYSDEV dev, INT x, INT y )
     pts[1].x = x;
     pts[1].y = y;
 
-    lp_to_dp(dc, pts, 2);
+    lp_to_rp(dc, pts, 2);
 
     if (pdev->pen_uses_region && !(region = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) return FALSE;
 
@@ -1183,6 +1206,7 @@ BOOL dibdrv_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
     int rop2 = get_rop2_from_rop( rop );
     struct clipped_rects clipped_rects;
     DWORD and = 0, xor = 0;
+    POINT brush_org;
     BOOL ret = TRUE;
 
     TRACE("(%p, %d, %d, %d, %d, %06x)\n", dev, dst->x, dst->y, dst->width, dst->height, rop);
@@ -1203,7 +1227,7 @@ BOOL dibdrv_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
         break;
     default:
         ret = brush->rects( pdev, brush, &pdev->dib, clipped_rects.count, clipped_rects.rects,
-                            &dc->attr->brush_org, rop2 );
+                            get_raster_brush_org( dc, &brush_org ), rop2 );
         break;
     }
     free_clipped_rects( &clipped_rects );
@@ -1267,7 +1291,7 @@ BOOL dibdrv_PolyPolygon( PHYSDEV dev, const POINT *pt, const INT *counts, UINT p
         if (!points) return FALSE;
     }
     memcpy( points, pt, total * sizeof(*pt) );
-    lp_to_dp( dc, points, total );
+    lp_to_rp( dc, points, total );
 
     if (pdev->brush.style != BS_NULL &&
         get_dib_rect( &pdev->dib, &rc ) &&
@@ -1338,7 +1362,7 @@ BOOL dibdrv_PolyPolyline( PHYSDEV dev, const POINT* pt, const DWORD* counts, DWO
         if (!points) return FALSE;
     }
     memcpy( points, pt, total * sizeof(*pt) );
-    lp_to_dp( dc, points, total );
+    lp_to_rp( dc, points, total );
 
     if (pdev->pen_uses_region && !(outline = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
     {
@@ -1393,8 +1417,9 @@ BOOL dibdrv_Rectangle( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
 
     if (pdev->pen_uses_region && !(outline = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) return FALSE;
 
-    rect.right--;
-    rect.bottom--;
+    /* move the right and bottom edges to the last device pixel */
+    rect.right  -= dc->gdi_scale;
+    rect.bottom -= dc->gdi_scale;
     reset_dash_origin(pdev);
 
     if (dc->attr->arc_direction == AD_CLOCKWISE)
@@ -1432,10 +1457,13 @@ BOOL dibdrv_Rectangle( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
     }
     else
     {
-        rect.left   += (pdev->pen_width + 1) / 2;
-        rect.top    += (pdev->pen_width + 1) / 2;
-        rect.right  -= pdev->pen_width / 2;
-        rect.bottom -= pdev->pen_width / 2;
+        /* the inset is computed in device pixels */
+        int width = pdev->pen_device_width, scale = pdev->pen_scale;
+
+        rect.left   += scale * ((width + 1) / 2);
+        rect.top    += scale * ((width + 1) / 2);
+        rect.right  -= scale * (width / 2);
+        rect.bottom -= scale * (width / 2);
         ret = brush_rect( pdev, &pdev->brush, &rect, pdev->clip );
     }
     return ret;
@@ -1460,7 +1488,7 @@ BOOL dibdrv_RoundRect( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
     pt[0].x = pt[0].y = 0;
     pt[1].x = ellipse_width;
     pt[1].y = ellipse_height;
-    lp_to_dp( dc, pt, 2 );
+    lp_to_rp( dc, pt, 2 );
     ellipse_width = min( rect.right - rect.left, abs( pt[1].x - pt[0].x ));
     ellipse_height = min( rect.bottom - rect.top, abs( pt[1].y - pt[0].y ));
     if (ellipse_width <= 2|| ellipse_height <= 2)
@@ -1579,11 +1607,11 @@ COLORREF dibdrv_SetPixel( PHYSDEV dev, INT x, INT y, COLORREF color )
 
     pt.x = x;
     pt.y = y;
-    lp_to_dp( dc, &pt, 1 );
+    lp_to_rp( dc, &pt, 1 );
     rect.left = pt.x;
     rect.top =  pt.y;
-    rect.right = rect.left + 1;
-    rect.bottom = rect.top + 1;
+    rect.right = rect.left + dc->gdi_scale;
+    rect.bottom = rect.top + dc->gdi_scale;
     add_clipped_bounds( pdev, &rect, pdev->clip );
 
     /* SetPixel doesn't do the 1bpp massaging like other fg colors */

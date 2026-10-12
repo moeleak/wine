@@ -997,6 +997,7 @@ DWORD dibdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
     DWORD ret = ERROR_SUCCESS;
     dib_info src_dib;
     HRGN tmp_rgn = 0;
+    POINT brush_org;
     dibdrv_physdev *pdev = get_dibdrv_pdev( dev );
     BOOL stretch = (src->width != dst->width) || (src->height != dst->height);
 
@@ -1034,7 +1035,7 @@ DWORD dibdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
         }
         else
             ret = execute_rop( pdev, &dst->visrect, &src_dib, &src->visrect, &clipped_rects,
-                               &dc->attr->brush_org, rop );
+                               get_raster_brush_org( dc, &brush_org ), rop );
         free_clipped_rects( &clipped_rects );
     }
     free_dib_info( &src_dib );
@@ -1450,7 +1451,7 @@ BOOL dibdrv_GradientFill( PHYSDEV dev, TRIVERTEX *vert_array, ULONG nvert,
         pts[i].x = vert_array[i].x;
         pts[i].y = vert_array[i].y;
     }
-    lp_to_dp( dc, pts, nvert );
+    lp_to_rp( dc, pts, nvert );
 
     switch (mode)
     {

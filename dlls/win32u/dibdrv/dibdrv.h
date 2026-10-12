@@ -104,7 +104,9 @@ typedef struct dibdrv_physdev
     /* pen */
     UINT pen_style, pen_endcap, pen_join;
     BOOL pen_uses_region, pen_is_ext;
-    int pen_width;
+    int pen_width;         /* in raster pixels */
+    int pen_device_width;  /* in device pixels */
+    int pen_scale;         /* raster scale of the DC when the pen was selected */
     dib_brush pen_brush;
     dash_pattern pen_pattern;
     dash_pos dash_pos;
@@ -161,6 +163,15 @@ extern BOOL     dibdrv_StrokePath( PHYSDEV dev );
 static inline dibdrv_physdev *get_dibdrv_pdev( PHYSDEV dev )
 {
     return (dibdrv_physdev *)dev;
+}
+
+/* brush origin in raster coordinates */
+static inline const POINT *get_raster_brush_org( DC *dc, POINT *buf )
+{
+    if (dc->gdi_scale == 1) return &dc->attr->brush_org;
+    buf->x = scale_device_coord( dc->attr->brush_org.x, dc->gdi_scale );
+    buf->y = scale_device_coord( dc->attr->brush_org.y, dc->gdi_scale );
+    return buf;
 }
 
 struct line_params
