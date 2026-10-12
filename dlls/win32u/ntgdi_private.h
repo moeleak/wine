@@ -64,6 +64,7 @@ typedef struct tagDC
     struct opengl_drawable *opengl_drawable; /* GL driver drawable for the DC */
 
     RECT         device_rect;      /* rectangle for the whole device */
+    UINT         gdi_scale;        /* raster pixels per device unit (GDI scaling), never in DC_ATTR */
     int          pixel_format;     /* pixel format (for memory DCs) */
     UINT         aa_flags;         /* anti-aliasing flags to pass to GetGlyphOutline for current font */
     WCHAR        display[CCHDEVICENAME]; /* Display name when created for a specific display device */
@@ -73,6 +74,7 @@ typedef struct tagDC
     HRGN          hMetaRgn;      /* Meta region */
     HRGN          hVisRgn;       /* Visible region */
     HRGN          region;        /* Total DC region (intersection of clip and visible) */
+    HRGN          raster_region; /* gdi_scale x get_dc_region(), only when gdi_scale > 1 */
     HPEN          hPen;
     HBRUSH        hBrush;
     HFONT         hFont;
@@ -163,6 +165,7 @@ extern void free_brush_pattern( struct brush_pattern *pattern );
 /* clipping.c */
 extern BOOL clip_device_rect( DC *dc, RECT *dst, const RECT *src );
 extern BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src );
+extern BOOL get_dc_raster_device_rect( DC *dc, RECT *rect );
 extern void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect,
                                 const RECT *device_rect, struct window_surface *surface );
 extern void update_dc_clipping( DC * dc );
@@ -174,6 +177,12 @@ static inline HRGN get_dc_region( DC *dc )
     if (dc->hVisRgn) return dc->hVisRgn;
     if (dc->hClipRgn) return dc->hClipRgn;
     return dc->hMetaRgn;
+}
+
+/* Return the total DC region (if any) in raster coordinates */
+static inline HRGN get_dc_raster_region( DC *dc )
+{
+    return dc->gdi_scale > 1 ? dc->raster_region : get_dc_region( dc );
 }
 
 /* dc.c */
@@ -392,6 +401,7 @@ extern void make_gdi_object_system( HGDIOBJ handle, BOOL set );
 /* mapping.c */
 extern BOOL dp_to_lp( DC *dc, POINT *points, INT count );
 extern void lp_to_dp( DC *dc, POINT *points, INT count );
+extern void lp_to_rp( DC *dc, POINT *points, INT count );
 extern BOOL set_map_mode( DC *dc, int mode );
 extern void combine_transform( XFORM *result, const XFORM *xform1,
                                const XFORM *xform2 );
@@ -569,6 +579,39 @@ static inline void get_bounding_rect( RECT *rect, int x, int y, int width, int h
         rect->top = rect->bottom + 1;
         rect->bottom = tmp + 1;
     }
+}
+
+/* Raster coordinates are device coordinates multiplied by the GDI scaling factor of the DC:
+ * the device pixel x covers the raster pixels [x * scale, x * scale + scale). */
+static inline int scale_device_coord( int val, UINT scale )
+{
+    LONGLONG ret = (LONGLONG)val * scale;
+
+    if (ret > 0x3fffffff) return 0x3fffffff;
+    if (ret < -0x3fffffff) return -0x3fffffff;
+    return ret;
+}
+
+static inline RECT scale_rect( RECT rect, UINT scale )
+{
+    if (scale == 1) return rect;
+    rect.left   = scale_device_coord( rect.left, scale );
+    rect.top    = scale_device_coord( rect.top, scale );
+    rect.right  = scale_device_coord( rect.right, scale );
+    rect.bottom = scale_device_coord( rect.bottom, scale );
+    return rect;
+}
+
+/* Map final device coordinates to raster coordinates. A negative extent starts at the
+ * last raster pixel of its device pixel, so that get_bounding_rect() returns the scaled
+ * device rectangle. The visible rectangle is not mapped and has to be computed afterwards. */
+static inline void scale_bitblt_coords( struct bitblt_coords *coords, UINT scale )
+{
+    if (scale == 1) return;
+    coords->x = scale_device_coord( coords->x, scale ) + (coords->width < 0 ? (int)scale - 1 : 0);
+    coords->y = scale_device_coord( coords->y, scale ) + (coords->height < 0 ? (int)scale - 1 : 0);
+    coords->width  = scale_device_coord( coords->width, scale );
+    coords->height = scale_device_coord( coords->height, scale );
 }
 
 static inline void reset_bounds( RECT *bounds )

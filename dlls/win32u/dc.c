@@ -220,6 +220,7 @@ DC *alloc_dc_ptr( DWORD magic )
     dc->hBrush              = GDI_inc_ref_count( GetStockObject( WHITE_BRUSH ));
     dc->hFont               = GDI_inc_ref_count( GetStockObject( SYSTEM_FONT ));
     dc->hPalette            = GetStockObject( DEFAULT_PALETTE );
+    dc->gdi_scale           = 1;
 
     set_initial_dc_state( dc );
 
@@ -253,6 +254,7 @@ static void free_dc_state( DC *dc )
     if (dc->hMetaRgn) NtGdiDeleteObjectApp( dc->hMetaRgn );
     if (dc->hVisRgn) NtGdiDeleteObjectApp( dc->hVisRgn );
     if (dc->region) NtGdiDeleteObjectApp( dc->region );
+    if (dc->raster_region) NtGdiDeleteObjectApp( dc->raster_region );
     if (dc->path) free_gdi_path( dc->path );
     free_dc_attr( dc->attr );
     free( dc );
