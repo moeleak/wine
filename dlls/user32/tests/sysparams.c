@@ -51,6 +51,7 @@ static BOOL (WINAPI *pPhysicalToLogicalPointForPerMonitorDPI)(HWND,POINT*);
 static LONG (WINAPI *pGetAutoRotationState)(PAR_STATE);
 static BOOL (WINAPI *pAreDpiAwarenessContextsEqual)(DPI_AWARENESS_CONTEXT,DPI_AWARENESS_CONTEXT);
 static LONG (WINAPI *pGetDpiFromDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+static DPI_AWARENESS_CONTEXT (WINAPI *pGetDpiAwarenessContextForProcess)(HANDLE);
 
 static BOOL strict;
 static int dpi, real_dpi;
@@ -4116,7 +4117,39 @@ static void test_manifest_dpi_child( int arg )
     winetest_pop_context();
 }
 
-static void run_with_manifest( char **argv, const char *settings, int expect )
+static void test_manifest_default_dpi_child(void)
+{
+    DPI_AWARENESS_CONTEXT ctx, old_ctx;
+    WCHAR buffer[16];
+    BOOL loaded, ret;
+
+    loaded = QueryActCtxSettingsW( 0, NULL, L"http://schemas.microsoft.com/SMI/2017/WindowsSettings",
+                                   L"gdiScaling", buffer, ARRAY_SIZE(buffer), NULL );
+    old_ctx = pGetThreadDpiAwarenessContext();
+    ok( pAreDpiAwarenessContextsEqual( old_ctx, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ) ||
+        broken( !loaded && pAreDpiAwarenessContextsEqual( old_ctx, DPI_AWARENESS_CONTEXT_UNAWARE ) ),
+        "got %p\n", old_ctx );
+    if (pGetDpiAwarenessContextForProcess)
+    {
+        ctx = pGetDpiAwarenessContextForProcess( GetCurrentProcess() );
+        ok( pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ) ||
+            broken( !loaded && pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_UNAWARE ) ),
+            "got process context %p\n", ctx );
+    }
+    else win_skip( "GetDpiAwarenessContextForProcess not supported\n" );
+
+    /* the manifest doesn't set the DPI awareness, so it can still be changed on Wine;
+     * the result on Windows isn't known yet */
+    SetLastError( 0xdeadbeef );
+    ret = pSetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 );
+    trace( "SetProcessDpiAwarenessContext returned %d, error %lu\n", ret, GetLastError() );
+    if (winetest_platform_is_wine) ok( ret, "SetProcessDpiAwarenessContext failed, error %lu\n", GetLastError() );
+    ctx = pGetThreadDpiAwarenessContext();
+    ok( pAreDpiAwarenessContextsEqual( ctx, ret ? DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 : old_ctx ),
+        "got %p\n", ctx );
+}
+
+static void run_with_manifest( char **argv, const char *settings, const char *args )
 {
     static const char manifest_fmt[] =
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
@@ -4160,7 +4193,7 @@ static void run_with_manifest( char **argv, const char *settings, int expect )
         ok( ret, "WriteFile failed, error %lu\n", GetLastError() );
         CloseHandle( file );
 
-        sprintf( cmdline, "\"%s\" %s ManifestDpi %d", exe, argv[1], expect );
+        sprintf( cmdline, "\"%s\" %s %s", exe, argv[1], args );
         ret = CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &info );
         ok( ret, "CreateProcessA failed, error %lu\n", GetLastError() );
         if (ret) wait_child_process( &info );
@@ -4937,6 +4970,7 @@ START_TEST(sysparams)
     pGetAutoRotationState = (void*)GetProcAddress(hdll, "GetAutoRotationState");
     pAreDpiAwarenessContextsEqual = (void*)GetProcAddress(hdll, "AreDpiAwarenessContextsEqual");
     pGetDpiFromDpiAwarenessContext = (void*)GetProcAddress(hdll, "GetDpiFromDpiAwarenessContext");
+    pGetDpiAwarenessContextForProcess = (void*)GetProcAddress(hdll, "GetDpiAwarenessContextForProcess");
 
     argc = winetest_get_mainargs(&argv);
 
@@ -4949,6 +4983,11 @@ START_TEST(sysparams)
     if (argc > 3 && !strcmp( argv[2], "ManifestDpi" ))
     {
         test_manifest_dpi_child( atoi( argv[3] ) );
+        return;
+    }
+    if (argc > 2 && !strcmp( argv[2], "ManifestDefaultDpi" ))
+    {
+        test_manifest_default_dpi_child();
         return;
     }
 
@@ -5054,16 +5093,17 @@ START_TEST(sysparams)
             test_app_compat_layer( argv, "~ HIGHDPIAWARE GDIDPISCALING", -2 );
 
             run_with_manifest( argv, "<ws05:dpiAware>false</ws05:dpiAware>"
-                               "<ws17:gdiScaling>true</ws17:gdiScaling>", -5 );
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDpi -5" );
             run_with_manifest( argv, "<ws16:dpiAwareness>unaware</ws16:dpiAwareness>"
-                               "<ws17:gdiScaling>true</ws17:gdiScaling>", -5 );
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDpi -5" );
             run_with_manifest( argv, "<ws05:dpiAware>true</ws05:dpiAware>"
-                               "<ws17:gdiScaling>true</ws17:gdiScaling>", -2 );
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDpi -2" );
             run_with_manifest( argv, "<ws16:dpiAwareness>PerMonitorV2</ws16:dpiAwareness>"
-                               "<ws17:gdiScaling>true</ws17:gdiScaling>", -4 );
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDpi -4" );
+            run_with_manifest( argv, "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDefaultDpi" );
         }
         test_app_compat_layer( argv, "~ DPIUNAWARE", -1 );
         test_app_compat_layer( argv, "~ HIGHDPIAWARE", -2 );
-        run_with_manifest( argv, "<ws05:dpiAware>false</ws05:dpiAware>", -1 );
+        run_with_manifest( argv, "<ws05:dpiAware>false</ws05:dpiAware>", "ManifestDpi -1" );
     }
 }

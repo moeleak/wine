@@ -227,7 +227,11 @@ void SYSPARAMS_Init(void)
             SetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE );
         else
             SetProcessDpiAwarenessContext( unaware );
+        return;
     }
+
+    /* without a DPI awareness setting, the application can still change its DPI awareness */
+    if (gdi_scaling) NtUserSetDefaultProcessDpiAwarenessContext( NTUSER_DPI_PER_UNAWARE_GDISCALED );
 }
 
 static BOOL update_desktop_wallpaper(void)
