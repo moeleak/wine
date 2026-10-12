@@ -4019,6 +4019,84 @@ static void test_SetProcessDpiAwarenessContext( ULONG arg )
     winetest_pop_context();
 }
 
+static void test_app_compat_layer_child( int arg )
+{
+    DPI_AWARENESS_CONTEXT expect_ctx = LongToHandle( arg ), ctx, window_ctx;
+    HWND hwnd;
+
+    winetest_push_context( "%d", arg );
+
+    ctx = pGetThreadDpiAwarenessContext();
+    ok( pAreDpiAwarenessContextsEqual( ctx, expect_ctx ) ||
+        broken( pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_UNAWARE ) ) /* shim engine not applied */ ||
+        broken( expect_ctx == DPI_AWARENESS_CONTEXT_SYSTEM_AWARE && /* HIGHDPIAWARE is per-monitor on Win10 1703+ */
+                (pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE ) ||
+                 pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 )) ),
+        "got %p\n", ctx );
+
+    hwnd = CreateWindowExA( 0, "static", "Test", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100,
+                            0, 0, GetModuleHandleA( 0 ), NULL );
+    ok( hwnd != 0, "failed to create window\n" );
+    window_ctx = pGetWindowDpiAwarenessContext( hwnd );
+    ok( pAreDpiAwarenessContextsEqual( window_ctx, ctx ), "got window context %p / %p\n", window_ctx, ctx );
+    DestroyWindow( hwnd );
+
+    winetest_pop_context();
+}
+
+static void test_app_compat_layer( char **argv, const char *flags, int expect )
+{
+    static const char compat_key[] = "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags";
+    static const char layers_key[] = "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers";
+    char path[MAX_PATH], name[MAX_PATH], args[64], *p;
+    DWORD compat_disposition, layers_disposition;
+    HKEY compat, key;
+    LONG ret;
+
+    winetest_push_context( "%s", flags );
+
+    /* AppCompatFlags doesn't exist by default on Wine, remove it again if we create it */
+    ret = RegCreateKeyExA( HKEY_CURRENT_USER, compat_key, 0, NULL, 0, KEY_CREATE_SUB_KEY, NULL,
+                           &compat, &compat_disposition );
+    ok( !ret, "RegCreateKeyExA failed, error %ld\n", ret );
+    if (ret)
+    {
+        winetest_pop_context();
+        return;
+    }
+    ret = RegCreateKeyExA( compat, "Layers", 0, NULL, 0, KEY_SET_VALUE, NULL, &key, &layers_disposition );
+    ok( !ret, "RegCreateKeyExA failed, error %ld\n", ret );
+    RegCloseKey( compat );
+    if (ret)
+    {
+        if (compat_disposition == REG_CREATED_NEW_KEY) RegDeleteKeyA( HKEY_CURRENT_USER, compat_key );
+        winetest_pop_context();
+        return;
+    }
+
+    /* Windows looks up the full image path, Wine the lowercased file name */
+    GetModuleFileNameA( NULL, path, sizeof(path) );
+    p = strrchr( path, '\\' );
+    strcpy( name, p ? p + 1 : path );
+    CharLowerA( name );
+
+    ret = RegSetValueExA( key, name, 0, REG_SZ, (const BYTE *)flags, strlen( flags ) + 1 );
+    ok( !ret, "RegSetValueExA failed, error %ld\n", ret );
+    ret = RegSetValueExA( key, path, 0, REG_SZ, (const BYTE *)flags, strlen( flags ) + 1 );
+    ok( !ret, "RegSetValueExA failed, error %ld\n", ret );
+
+    sprintf( args, "AppCompatLayer %d", expect );
+    run_in_process( argv, args );
+
+    RegDeleteValueA( key, name );
+    RegDeleteValueA( key, path );
+    RegCloseKey( key );
+    if (layers_disposition == REG_CREATED_NEW_KEY) RegDeleteKeyA( HKEY_CURRENT_USER, layers_key );
+    if (compat_disposition == REG_CREATED_NEW_KEY) RegDeleteKeyA( HKEY_CURRENT_USER, compat_key );
+
+    winetest_pop_context();
+}
+
 static void test_SetThreadDpiAwarenessContext(void)
 {
     DPI_AWARENESS_CONTEXT ctx, old_ctx;
@@ -4785,6 +4863,15 @@ START_TEST(sysparams)
     pAreDpiAwarenessContextsEqual = (void*)GetProcAddress(hdll, "AreDpiAwarenessContextsEqual");
     pGetDpiFromDpiAwarenessContext = (void*)GetProcAddress(hdll, "GetDpiFromDpiAwarenessContext");
 
+    argc = winetest_get_mainargs(&argv);
+
+    /* run before get_real_dpi(), which expects the default process DPI awareness */
+    if (argc > 3 && !strcmp( argv[2], "AppCompatLayer" ))
+    {
+        test_app_compat_layer_child( atoi( argv[3] ) );
+        return;
+    }
+
     hInstance = GetModuleHandleA( NULL );
     hdc = GetDC(0);
     dpi = GetDeviceCaps( hdc, LOGPIXELSY);
@@ -4795,7 +4882,6 @@ START_TEST(sysparams)
     if (!SystemParametersInfoA( SPI_SETBEEP, TRUE, 0, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE ) &&
         GetLastError()==ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION) return;
 
-    argc = winetest_get_mainargs(&argv);
     strict=(argc >= 3 && strcmp(argv[2],"strict")==0);
 
     if (argc > 3 && !strcmp( argv[2], "SetProcessDpiAwarenessContext" ))
@@ -4879,5 +4965,15 @@ START_TEST(sysparams)
         run_in_process( argv, "SetProcessDpiAwarenessContext 0xfffffffd" );
         run_in_process( argv, "SetProcessDpiAwarenessContext 0xfffffffc" );
         run_in_process( argv, "SetProcessDpiAwarenessContext 0xfffffffb" );
+
+        if (!pIsValidDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ))
+            win_skip( "DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED not supported\n" );
+        else
+        {
+            test_app_compat_layer( argv, "~ GDIDPISCALING DPIUNAWARE", -5 );
+            test_app_compat_layer( argv, "~ HIGHDPIAWARE GDIDPISCALING", -2 );
+        }
+        test_app_compat_layer( argv, "~ DPIUNAWARE", -1 );
+        test_app_compat_layer( argv, "~ HIGHDPIAWARE", -2 );
     }
 }

@@ -6088,6 +6088,7 @@ void sysparams_init(void)
     if (app_compat_flags)
     {
         if (strstr( app_compat_flags, "HIGHDPIAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_SYSTEM_AWARE, 0 );
+        if (strstr( app_compat_flags, "GDIDPISCALING" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_PER_UNAWARE_GDISCALED, 0 );
         if (strstr( app_compat_flags, "DPIUNAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_UNAWARE, 0 );
     }
     free( app_compat_flags );
