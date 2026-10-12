@@ -162,6 +162,7 @@ static void add_pen_lines_bounds( dibdrv_physdev *dev, int count, const POINT *p
             release_wine_region( rgn );
         }
     }
+    else if (dev->pen_scale > 1) width = dev->pen_scale - 1;  /* include the whole device pixel */
 
     while (count-- > 0)
     {
