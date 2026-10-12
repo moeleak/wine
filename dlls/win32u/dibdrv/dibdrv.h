@@ -73,6 +73,9 @@ typedef struct dib_brush
     COLORREF colorref;
     dib_info dib;
     rop_mask_bits masks;
+    UINT     scaled_scale;  /* raster scale of scaled_masks, 0 if they are not built */
+    dib_info scaled_dib;    /* size of scaled_masks, the bits are not used */
+    rop_mask_bits scaled_masks;
     struct brush_pattern pattern;
     BOOL (*rects)(struct dibdrv_physdev *pdev, struct dib_brush *brush, dib_info *dib,
                   int num, const RECT *rects, const POINT *brush_org, INT rop);

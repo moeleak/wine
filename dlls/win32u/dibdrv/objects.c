@@ -2107,12 +2107,67 @@ static void free_brush_mask_bits( dib_brush *brush )
 {
     if (brush->masks.xor != brush->dib.bits.ptr) free( brush->masks.xor );
     brush->masks.and = brush->masks.xor = NULL;
+    free( brush->scaled_masks.xor );
+    brush->scaled_masks.and = brush->scaled_masks.xor = NULL;
+    brush->scaled_scale = 0;
 }
 
 void free_pattern_brush( dib_brush *brush )
 {
     free_brush_mask_bits( brush );
     free_dib_info( &brush->dib );
+}
+
+/* fill a width x height 32-bpp mask with scale x scale blocks of the src pixels */
+static void scale_mask_bits( DWORD *dst, const DWORD *src, int src_stride,
+                             int width, int height, int scale )
+{
+    int x, y;
+
+    for (y = 0; y < height; y++, dst += width)
+        for (x = 0; x < width; x++) dst[x] = src[(y / scale) * src_stride + x / scale];
+}
+
+/* Patterns are tiled in raster pixels, so a raster-scaled DC uses masks where
+ * each pixel is replicated, to keep the pattern in device pixels. Only 32-bpp
+ * brushes are scaled, which covers all the window surfaces. */
+static BOOL scale_brush_masks( dib_brush *brush, UINT scale )
+{
+    int width = brush->dib.width, height = brush->dib.height;
+    UINT64 size;
+    DWORD *bits;
+
+    assert( brush->dib.bit_count == 32 );
+    assert( brush->dib.stride > 0 );
+
+    free( brush->scaled_masks.xor );
+    brush->scaled_masks.and = brush->scaled_masks.xor = NULL;
+    brush->scaled_scale = 0;
+
+    if (width > INT_MAX / 4 / scale || height > INT_MAX / scale) return FALSE;
+    width *= scale;
+    height *= scale;
+    size = (UINT64)width * 4 * height;
+    if (size > INT_MAX / 2) return FALSE;
+    if (!(bits = malloc( brush->masks.and ? 2 * size : size ))) return FALSE;
+
+    brush->scaled_masks.xor = bits;
+    scale_mask_bits( bits, brush->masks.xor, brush->dib.stride / 4, width, height, scale );
+    if (brush->masks.and)
+    {
+        brush->scaled_masks.and = (char *)bits + size;
+        scale_mask_bits( brush->scaled_masks.and, brush->masks.and, brush->dib.stride / 4,
+                         width, height, scale );
+    }
+
+    brush->scaled_dib = brush->dib;
+    brush->scaled_dib.width  = width;
+    brush->scaled_dib.height = height;
+    brush->scaled_dib.stride = width * 4;
+    SetRect( &brush->scaled_dib.rect, 0, 0, width, height );
+    memset( &brush->scaled_dib.bits, 0, sizeof(brush->scaled_dib.bits) );  /* only the masks are used */
+    brush->scaled_scale = scale;
+    return TRUE;
 }
 
 static BOOL create_pattern_brush_bits( dib_brush *brush )
@@ -2316,7 +2371,8 @@ static BOOL select_pattern_brush( dibdrv_physdev *pdev, dib_brush *brush, BOOL *
 static BOOL pattern_brush(dibdrv_physdev *pdev, dib_brush *brush, dib_info *dib,
                           int num, const RECT *rects, const POINT *brush_org, INT rop)
 {
-    BOOL needs_reselect = FALSE;
+    UINT scale = get_physdev_dc( &pdev->dev )->gdi_scale;
+    BOOL needs_reselect = FALSE, ret = TRUE;
 
     if (rop != brush->rop)
     {
@@ -2351,10 +2407,19 @@ static BOOL pattern_brush(dibdrv_physdev *pdev, dib_brush *brush, dib_info *dib,
         }
     }
 
-    dib->funcs->pattern_rects( dib, num, rects, brush_org, &brush->dib, &brush->masks );
+    if (scale > 1 && brush->dib.bit_count == 32)
+    {
+        if (brush->scaled_scale == scale || scale_brush_masks( brush, scale ))
+            dib->funcs->pattern_rects( dib, num, rects, brush_org,
+                                       &brush->scaled_dib, &brush->scaled_masks );
+        else
+            ret = FALSE;
+    }
+    else
+        dib->funcs->pattern_rects( dib, num, rects, brush_org, &brush->dib, &brush->masks );
 
     if (needs_reselect) free_pattern_brush( brush );
-    return TRUE;
+    return ret;
 }
 
 static BOOL null_brush(dibdrv_physdev *pdev, dib_brush *brush, dib_info *dib,
