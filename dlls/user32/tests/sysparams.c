@@ -4514,11 +4514,14 @@ static LRESULT CALLBACK dpi_winproc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
 
 static void test_dpi_window(void)
 {
-    DPI_AWARENESS_CONTEXT context, orig;
+    DPI_AWARENESS_CONTEXT context, context2, orig;
     DPI_AWARENESS awareness;
     ULONG_PTR i, j;
     UINT dpi;
-    HWND hwnd, child, ret;
+    HWND hwnd, child, ret, plain;
+    RECT window_rect, client_rect, rect;
+    int log_x, log_y, x, y;
+    HDC hdc;
     MSG msg = { 0, WM_USER + 1, 0, 0 };
 
     if (!pGetWindowDpiAwarenessContext)
@@ -4634,6 +4637,71 @@ static void test_dpi_window(void)
     ok( awareness == DPI_AWARENESS_PER_MONITOR_AWARE, "wrong awareness %u\n", awareness );
     dpi = pGetDpiForWindow( GetDesktopWindow() );
     ok( dpi == real_dpi, "got %u / %u\n", dpi, real_dpi );
+
+    /* GDI-scaled windows are DPI unaware windows with a distinct context */
+    if (!pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ))
+    {
+        win_skip( "DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED not supported\n" );
+        pSetThreadDpiAwarenessContext( orig );
+        return;
+    }
+
+    hwnd = CreateWindowExA( 0, "DpiTestClass", "Test", WS_OVERLAPPEDWINDOW,
+                            0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( hwnd != 0, "failed to create window\n" );
+    child = CreateWindowExA( 0, "DpiTestClass", "Test", WS_CHILD,
+                             0, 0, 50, 50, hwnd, 0, GetModuleHandleA(0), NULL );
+    ok( child != 0, "failed to create window\n" );
+
+    context = pGetWindowDpiAwarenessContext( hwnd );
+    ok( pAreDpiAwarenessContextsEqual( context, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ),
+        "wrong context %p\n", context );
+    ok( !pAreDpiAwarenessContextsEqual( context, DPI_AWARENESS_CONTEXT_UNAWARE ),
+        "wrong context %p\n", context );
+    awareness = pGetAwarenessFromDpiAwarenessContext( context );
+    ok( awareness == DPI_AWARENESS_UNAWARE, "wrong awareness %u\n", awareness );
+    context2 = pGetWindowDpiAwarenessContext( child );
+    ok( pAreDpiAwarenessContextsEqual( context2, context ), "wrong child context %p / %p\n", context2, context );
+    dpi = pGetDpiForWindow( hwnd );
+    ok( dpi == USER_DEFAULT_SCREEN_DPI, "got %u\n", dpi );
+    dpi = pGetDpiForWindow( child );
+    ok( dpi == USER_DEFAULT_SCREEN_DPI, "got child %u\n", dpi );
+
+    /* query the GDI-scaled window from its own context, as the application would */
+    GetWindowRect( hwnd, &window_rect );
+    GetClientRect( hwnd, &client_rect );
+    hdc = GetDC( hwnd );
+    log_x = GetDeviceCaps( hdc, LOGPIXELSX );
+    log_y = GetDeviceCaps( hdc, LOGPIXELSY );
+    ReleaseDC( hwnd, hdc );
+    ok( log_x == USER_DEFAULT_SCREEN_DPI, "got LOGPIXELSX %d\n", log_x );
+    ok( log_y == USER_DEFAULT_SCREEN_DPI, "got LOGPIXELSY %d\n", log_y );
+
+    /* compare with an identical plain DPI unaware window */
+    pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE );
+    plain = CreateWindowExA( 0, "DpiTestClass", "Test", WS_OVERLAPPEDWINDOW,
+                             0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( plain != 0, "failed to create window\n" );
+    context2 = pGetWindowDpiAwarenessContext( plain );
+    ok( pAreDpiAwarenessContextsEqual( context2, DPI_AWARENESS_CONTEXT_UNAWARE ),
+        "wrong context %p\n", context2 );
+
+    GetWindowRect( plain, &rect );
+    ok( EqualRect( &window_rect, &rect ), "got window rect %s, expected %s\n",
+        wine_dbgstr_rect(&window_rect), wine_dbgstr_rect(&rect) );
+    GetClientRect( plain, &rect );
+    ok( EqualRect( &client_rect, &rect ), "got client rect %s, expected %s\n",
+        wine_dbgstr_rect(&client_rect), wine_dbgstr_rect(&rect) );
+    hdc = GetDC( plain );
+    x = GetDeviceCaps( hdc, LOGPIXELSX );
+    y = GetDeviceCaps( hdc, LOGPIXELSY );
+    ReleaseDC( plain, hdc );
+    ok( x == USER_DEFAULT_SCREEN_DPI, "got LOGPIXELSX %d\n", x );
+    ok( y == USER_DEFAULT_SCREEN_DPI, "got LOGPIXELSY %d\n", y );
+    ok( log_x == x && log_y == y, "got LOGPIXELS %dx%d, expected %dx%d\n", log_x, log_y, x, y );
+
+    DestroyWindow( plain );
+    DestroyWindow( hwnd );
 
     pSetThreadDpiAwarenessContext( orig );
 }
