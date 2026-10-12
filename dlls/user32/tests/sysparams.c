@@ -4097,6 +4097,81 @@ static void test_app_compat_layer( char **argv, const char *flags, int expect )
     winetest_pop_context();
 }
 
+static void test_manifest_dpi_child( int arg )
+{
+    DPI_AWARENESS_CONTEXT expect_ctx = LongToHandle( arg ), ctx;
+    WCHAR buffer[16];
+    BOOL loaded;
+
+    winetest_push_context( "%d", arg );
+
+    /* Windows may ignore the external manifest, check whether its gdiScaling setting was loaded */
+    loaded = QueryActCtxSettingsW( 0, NULL, L"http://schemas.microsoft.com/SMI/2017/WindowsSettings",
+                                   L"gdiScaling", buffer, ARRAY_SIZE(buffer), NULL );
+    ctx = pGetThreadDpiAwarenessContext();
+    ok( pAreDpiAwarenessContextsEqual( ctx, expect_ctx ) ||
+        broken( !loaded && pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_UNAWARE ) ),
+        "got %p\n", ctx );
+
+    winetest_pop_context();
+}
+
+static void run_with_manifest( char **argv, const char *settings, int expect )
+{
+    static const char manifest_fmt[] =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+        "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"
+        "  <application xmlns=\"urn:schemas-microsoft-com:asm.v3\"\n"
+        "               xmlns:ws05=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\"\n"
+        "               xmlns:ws16=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\"\n"
+        "               xmlns:ws17=\"http://schemas.microsoft.com/SMI/2017/WindowsSettings\">\n"
+        "    <windowsSettings>%s</windowsSettings>\n"
+        "  </application>\n"
+        "</assembly>\n";
+    static unsigned int index;
+    STARTUPINFOA startup = {.cb = sizeof(STARTUPINFOA)};
+    PROCESS_INFORMATION info = {0};
+    char exe[MAX_PATH], path[MAX_PATH], cmdline[MAX_PATH * 2], manifest[1024];
+    HANDLE file;
+    DWORD size;
+    BOOL ret;
+
+    winetest_push_context( "%s", settings );
+
+    /* Windows caches the manifest lookup, use a new file name for each manifest */
+    GetTempPathA( ARRAY_SIZE(path), path );
+    sprintf( exe, "%sgdi_scaling_%u.exe", path, index++ );
+    GetModuleFileNameA( NULL, path, ARRAY_SIZE(path) );
+    ret = CopyFileA( path, exe, FALSE );
+    ok( ret, "CopyFileA failed, error %lu\n", GetLastError() );
+    if (!ret)
+    {
+        winetest_pop_context();
+        return;
+    }
+
+    sprintf( path, "%s.manifest", exe );
+    file = CreateFileA( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+    ok( file != INVALID_HANDLE_VALUE, "CreateFileA failed, error %lu\n", GetLastError() );
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        sprintf( manifest, manifest_fmt, settings );
+        ret = WriteFile( file, manifest, strlen( manifest ), &size, NULL );
+        ok( ret, "WriteFile failed, error %lu\n", GetLastError() );
+        CloseHandle( file );
+
+        sprintf( cmdline, "\"%s\" %s ManifestDpi %d", exe, argv[1], expect );
+        ret = CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &info );
+        ok( ret, "CreateProcessA failed, error %lu\n", GetLastError() );
+        if (ret) wait_child_process( &info );
+
+        DeleteFileA( path );
+    }
+    DeleteFileA( exe );
+
+    winetest_pop_context();
+}
+
 static void test_SetThreadDpiAwarenessContext(void)
 {
     DPI_AWARENESS_CONTEXT ctx, old_ctx;
@@ -4871,6 +4946,11 @@ START_TEST(sysparams)
         test_app_compat_layer_child( atoi( argv[3] ) );
         return;
     }
+    if (argc > 3 && !strcmp( argv[2], "ManifestDpi" ))
+    {
+        test_manifest_dpi_child( atoi( argv[3] ) );
+        return;
+    }
 
     hInstance = GetModuleHandleA( NULL );
     hdc = GetDC(0);
@@ -4972,8 +5052,18 @@ START_TEST(sysparams)
         {
             test_app_compat_layer( argv, "~ GDIDPISCALING DPIUNAWARE", -5 );
             test_app_compat_layer( argv, "~ HIGHDPIAWARE GDIDPISCALING", -2 );
+
+            run_with_manifest( argv, "<ws05:dpiAware>false</ws05:dpiAware>"
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", -5 );
+            run_with_manifest( argv, "<ws16:dpiAwareness>unaware</ws16:dpiAwareness>"
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", -5 );
+            run_with_manifest( argv, "<ws05:dpiAware>true</ws05:dpiAware>"
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", -2 );
+            run_with_manifest( argv, "<ws16:dpiAwareness>PerMonitorV2</ws16:dpiAwareness>"
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", -4 );
         }
         test_app_compat_layer( argv, "~ DPIUNAWARE", -1 );
         test_app_compat_layer( argv, "~ HIGHDPIAWARE", -2 );
+        run_with_manifest( argv, "<ws05:dpiAware>false</ws05:dpiAware>", -1 );
     }
 }
