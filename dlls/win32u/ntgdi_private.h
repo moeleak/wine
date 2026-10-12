@@ -421,6 +421,7 @@ extern HPEN create_pen( INT style, INT width, COLORREF color );
 /* region.c */
 extern BOOL add_rect_to_region( HRGN rgn, const RECT *rect );
 extern INT mirror_region( HRGN dst, HRGN src, INT width );
+extern INT scale_region( HRGN dst, HRGN src, UINT scale );
 extern BOOL mirror_window_region( HWND hwnd, HRGN hrgn );
 extern BOOL REGION_FrameRgn( HRGN dest, HRGN src, INT x, INT y );
 extern HRGN create_polypolygon_region( const POINT *pts, const INT *count, INT nbpolygons,

@@ -1380,6 +1380,73 @@ BOOL mirror_window_region( HWND hwnd, HRGN hrgn )
     return mirror_region( hrgn, hrgn, rect.right - rect.left ) != ERROR;
 }
 
+/***********************************************************************
+ *           REGION_ScaleRegion
+ *
+ * Multiply all the coordinates of a region by an integer factor. The
+ * mapping is strictly increasing, so the rectangles keep their order,
+ * their banding and their coalescing, and the result is a valid region.
+ * The caller must make sure that the scaled coordinates don't overflow.
+ */
+static BOOL REGION_ScaleRegion( WINEREGION *dst, WINEREGION *src, INT scale )
+{
+    int i;
+
+    if (!grow_region( dst, src->numRects )) return FALSE;
+    dst->numRects = src->numRects;
+
+    for (i = 0; i < src->numRects; i++)
+    {
+        dst->rects[i].left   = src->rects[i].left * scale;
+        dst->rects[i].top    = src->rects[i].top * scale;
+        dst->rects[i].right  = src->rects[i].right * scale;
+        dst->rects[i].bottom = src->rects[i].bottom * scale;
+    }
+
+    dst->extents.left   = src->extents.left * scale;
+    dst->extents.top    = src->extents.top * scale;
+    dst->extents.right  = src->extents.right * scale;
+    dst->extents.bottom = src->extents.bottom * scale;
+    return TRUE;
+}
+
+/***********************************************************************
+ *           scale_region
+ *
+ * Multiply all the coordinates of a region by an integer factor. The
+ * source is first clipped so that the result stays within +/-0x3fffffff.
+ */
+INT scale_region( HRGN dst, HRGN src, UINT scale )
+{
+    WINEREGION *src_rgn, *dst_rgn, safe;
+    INT limit, ret = ERROR;
+    BOOL ok;
+
+    if (!scale) return ERROR;
+    limit = 0x3fffffff / scale;
+
+    if (!(src_rgn = GDI_GetObjPtr( src, NTGDI_OBJ_REGION ))) return ERROR;
+    if ((dst_rgn = GDI_GetObjPtr( dst, NTGDI_OBJ_REGION )))
+    {
+        if (src_rgn->extents.left < -limit || src_rgn->extents.top < -limit ||
+            src_rgn->extents.right > limit || src_rgn->extents.bottom > limit)
+        {
+            init_region( &safe, 1 );
+            safe.numRects = 1;
+            SetRect( &safe.extents, -limit, -limit, limit, limit );
+            *safe.rects = safe.extents;
+            ok = REGION_IntersectRegion( dst_rgn, src_rgn, &safe ) &&
+                 REGION_ScaleRegion( dst_rgn, dst_rgn, scale );
+        }
+        else ok = REGION_ScaleRegion( dst_rgn, src_rgn, scale );
+
+        if (ok) ret = get_region_type( dst_rgn );
+        GDI_ReleaseObj( dst );
+    }
+    GDI_ReleaseObj( src );
+    return ret;
+}
+
 
 /***********************************************************************
  *           REGION_Coalesce
