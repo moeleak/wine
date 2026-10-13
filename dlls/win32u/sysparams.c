@@ -168,6 +168,7 @@ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
 
 BOOL emulate_modeset = FALSE;
 BOOL decorated_mode = TRUE;
+UINT gdi_scale_override = 0;
 UINT64 thunk_lock_callback = 0;
 
 #define VIRTUAL_HMONITOR ((HMONITOR)(UINT_PTR)(0x10000 + 1))
@@ -6084,6 +6085,10 @@ void sysparams_init(void)
         decorated_mode = IS_OPTION_TRUE( buffer[0] );
     if (!get_config_key( hkey, appkey, "EmulateModeset", buffer, sizeof(buffer) ))
         emulate_modeset = IS_OPTION_TRUE( buffer[0] );
+    /* GDI scale of GDI scaled windows: 0 for automatic, 1 to disable GDI scaling, 2 to 4 to force it */
+    if (!get_config_key( hkey, appkey, "GdiScaleFactor", buffer, sizeof(buffer) ) &&
+        buffer[0] >= '0' && buffer[0] <= '4')
+        gdi_scale_override = buffer[0] - '0';
 
 #undef IS_OPTION_TRUE
 
