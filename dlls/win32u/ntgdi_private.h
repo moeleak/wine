@@ -392,6 +392,8 @@ extern BOOL opentype_enum_style_names( const struct tt_name_v0 *tt_name_v0,
                                        opentype_enum_names_cb callback, void *user );
 extern BOOL opentype_enum_full_names( const struct tt_name_v0 *tt_name_v0,
                                       opentype_enum_names_cb callback, void *user );
+extern BOOL opentype_enum_names( const struct tt_name_v0 *tt_name_v0, USHORT name_id,
+                                 opentype_enum_names_cb callback, void *user );
 
 extern BOOL opentype_get_properties( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
                                      DWORD *version, FONTSIGNATURE *fs, DWORD *ntm_flags, UINT *weight );

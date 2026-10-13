@@ -565,7 +565,7 @@ static LANGID get_name_record_langid( enum OPENTYPE_PLATFORM_ID platform, USHORT
 }
 
 static BOOL opentype_enum_font_names( const struct tt_name_v0 *header, enum OPENTYPE_PLATFORM_ID platform,
-                                      enum OPENTYPE_NAME_ID name, opentype_enum_names_cb callback, void *user )
+                                      USHORT name, opentype_enum_names_cb callback, void *user )
 {
     const char *name_data;
     USHORT i, name_count, encoding, language, length, offset;
@@ -690,37 +690,30 @@ BOOL opentype_get_tt_name_v0( const void *data, size_t size, const struct ttc_sf
     return opentype_get_table_ptr( data, size, ttc_sfnt_v1, MS_NAME_TAG, (const void **)tt_name_v0, &table_size );
 }
 
-BOOL opentype_enum_family_names( const struct tt_name_v0 *header, opentype_enum_names_cb callback, void *user )
+BOOL opentype_enum_names( const struct tt_name_v0 *header, USHORT name_id, opentype_enum_names_cb callback, void *user )
 {
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_WIN, OPENTYPE_NAME_FAMILY, callback, user ))
+    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_WIN, name_id, callback, user ))
         return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_MAC, OPENTYPE_NAME_FAMILY, callback, user ))
+    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_MAC, name_id, callback, user ))
         return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_UNICODE, OPENTYPE_NAME_FAMILY, callback, user ))
+    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_UNICODE, name_id, callback, user ))
         return TRUE;
     return FALSE;
+}
+
+BOOL opentype_enum_family_names( const struct tt_name_v0 *header, opentype_enum_names_cb callback, void *user )
+{
+    return opentype_enum_names( header, OPENTYPE_NAME_FAMILY, callback, user );
 }
 
 BOOL opentype_enum_style_names( const struct tt_name_v0 *header, opentype_enum_names_cb callback, void *user )
 {
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_WIN, OPENTYPE_NAME_SUBFAMILY, callback, user ))
-        return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_MAC, OPENTYPE_NAME_SUBFAMILY, callback, user ))
-        return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_UNICODE, OPENTYPE_NAME_SUBFAMILY, callback, user ))
-        return TRUE;
-    return FALSE;
+    return opentype_enum_names( header, OPENTYPE_NAME_SUBFAMILY, callback, user );
 }
 
 BOOL opentype_enum_full_names( const struct tt_name_v0 *header, opentype_enum_names_cb callback, void *user )
 {
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_WIN, OPENTYPE_NAME_FULLNAME, callback, user ))
-        return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_MAC, OPENTYPE_NAME_FULLNAME, callback, user ))
-        return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_UNICODE, OPENTYPE_NAME_FULLNAME, callback, user ))
-        return TRUE;
-    return FALSE;
+    return opentype_enum_names( header, OPENTYPE_NAME_FULLNAME, callback, user );
 }
 
 BOOL opentype_get_properties( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
