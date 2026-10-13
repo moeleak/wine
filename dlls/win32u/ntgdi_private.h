@@ -329,6 +329,10 @@ struct gdi_font
 #define ADDFONT_EXTERNAL_FOUND 0x20
 #define ADDFONT_AA_FLAGS(flags) ((flags) << 16)
 
+/* private get_glyph_outline() format flag, never accepted from applications: hint the glyph the
+ * way the host renders text (fontconfig hintstyle) instead of the GDI way */
+#define WINE_GGO_HOST_HINTING 0x80000000
+
 struct font_backend_funcs
 {
     void  (*load_fonts)(void);

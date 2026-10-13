@@ -4074,6 +4074,8 @@ static DWORD font_GetGlyphOutline( PHYSDEV dev, UINT glyph, UINT format,
     struct font_physdev *physdev = get_font_dev( dev );
     DWORD ret;
 
+    if (format & WINE_GGO_HOST_HINTING) return GDI_ERROR;  /* private to the internal rasterizers */
+
     if (!physdev->font)
     {
         dev = GET_NEXT_PHYSDEV( dev, pGetGlyphOutline );

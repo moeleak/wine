@@ -158,6 +158,12 @@ MAKE_FUNCPTR(FcStrSetMember);
 #ifndef FC_PRGNAME
 #define FC_PRGNAME "prgname"
 #endif
+#ifndef FC_HINT_STYLE
+#define FC_HINT_STYLE "hintstyle"
+#define FC_HINT_NONE 0
+#define FC_HINT_SLIGHT 1
+#define FC_HINT_FULL 3
+#endif
 #endif /* SONAME_LIBFONTCONFIG */
 
 #undef MAKE_FUNCPTR
@@ -225,6 +231,9 @@ struct font_mapping
 static struct list mappings_list = LIST_INIT( mappings_list );
 
 static UINT default_aa_flags;
+/* how the host hints text by default, for WINE_GGO_HOST_HINTING; full is the GDI way */
+static enum { HOST_HINT_FULL, HOST_HINT_SLIGHT, HOST_HINT_NONE } host_hint_style;
+static BOOL host_autohint;
 static LCID system_lcid;
 
 static BOOL freetype_set_outline_text_metrics( struct gdi_font *font );
@@ -1169,6 +1178,32 @@ static UINT parse_aa_pattern( FcPattern *pattern )
     return aa_flags;
 }
 
+static void init_host_hinting(void)
+{
+    FcBool hinting = FcTrue, autohint = FcFalse;
+    int style = FC_HINT_FULL;
+    FcPattern *pattern;
+
+    if (!(pattern = pFcPatternCreate())) return;
+    pFcPatternAddString( pattern, FC_PRGNAME, (const FcChar8 *)"wine" );
+    /* same order as FcFontMatch and FcFontRenderPrepare */
+    pFcConfigSubstitute( NULL, pattern, FcMatchPattern );
+    pFcDefaultSubstitute( pattern );
+    pFcConfigSubstitute( NULL, pattern, FcMatchFont );
+    pFcPatternGetBool( pattern, FC_HINTING, 0, &hinting );
+    pFcPatternGetInteger( pattern, FC_HINT_STYLE, 0, &style );
+    pFcPatternGetBool( pattern, FC_AUTOHINT, 0, &autohint );
+    pFcPatternDestroy( pattern );
+
+    /* same mapping as cairo and Qt: medium is hinted like full */
+    host_hint_style = (!hinting || style == FC_HINT_NONE) ? HOST_HINT_NONE :
+                      style == FC_HINT_SLIGHT ? HOST_HINT_SLIGHT : HOST_HINT_FULL;
+    host_autohint = !!autohint;
+
+    TRACE( "hinting %d hintstyle %d autohint %d -> host hint style %u autohint %u\n",
+           hinting, style, autohint, host_hint_style, host_autohint );
+}
+
 static FcPattern *create_family_pattern( const char *name, FcPattern **cached )
 {
     FcPattern *ret = NULL, *tmp, *pattern;
@@ -1286,6 +1321,8 @@ static void init_fontconfig(void)
             default_aa_flags = parse_aa_pattern( pattern );
             pFcPatternDestroy( pattern );
         }
+
+        init_host_hinting();
 
         TRACE( "enabled, default flags = %x\n", default_aa_flags );
         fontconfig_enabled = TRUE;
@@ -3062,33 +3099,42 @@ static unsigned int get_bezier_glyph_outline(FT_Outline *outline, unsigned int b
 
 static FT_Int get_load_flags( UINT format )
 {
-    FT_Int load_flags = FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH;
+    FT_Int load_flags = FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH, target;
 
     if (format & GGO_UNHINTED)
         return load_flags | FT_LOAD_NO_HINTING;
 
-    switch (format & ~GGO_GLYPH_INDEX)
+    switch (format & ~(GGO_GLYPH_INDEX | WINE_GGO_HOST_HINTING))
     {
     case GGO_BITMAP:
-        load_flags |= FT_LOAD_TARGET_MONO;
-        break;
+        /* monochrome is always hinted the GDI way */
+        return load_flags | FT_LOAD_TARGET_MONO;
     case GGO_GRAY2_BITMAP:
     case GGO_GRAY4_BITMAP:
     case GGO_GRAY8_BITMAP:
     case WINE_GGO_GRAY16_BITMAP:
-        load_flags |= FT_LOAD_TARGET_NORMAL;
+        target = FT_LOAD_TARGET_NORMAL;
         break;
     case WINE_GGO_HRGB_BITMAP:
     case WINE_GGO_HBGR_BITMAP:
-        load_flags |= FT_LOAD_TARGET_LCD;
+        target = FT_LOAD_TARGET_LCD;
         break;
     case WINE_GGO_VRGB_BITMAP:
     case WINE_GGO_VBGR_BITMAP:
-        load_flags |= FT_LOAD_TARGET_LCD_V;
+        target = FT_LOAD_TARGET_LCD_V;
         break;
+    default:  /* GGO_METRICS, GGO_NATIVE, GGO_BEZIER */
+        return load_flags;
     }
 
-    return load_flags;
+    if (format & WINE_GGO_HOST_HINTING)
+    {
+        if (host_hint_style == HOST_HINT_NONE) return load_flags | FT_LOAD_NO_HINTING;
+        if (host_hint_style == HOST_HINT_SLIGHT) target = FT_LOAD_TARGET_LIGHT;
+        if (host_autohint) load_flags |= FT_LOAD_FORCE_AUTOHINT;
+    }
+
+    return load_flags | target;
 }
 
 /*************************************************************
@@ -3113,7 +3159,7 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
           font->matrix.eM11, font->matrix.eM12,
           font->matrix.eM21, font->matrix.eM22);
 
-    format &= ~GGO_UNHINTED;
+    format &= ~(GGO_UNHINTED | WINE_GGO_HOST_HINTING);
 
     matrices = get_transform_matrices( font, tategaki, lpmat, transform_matrices );
 
