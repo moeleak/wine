@@ -55,6 +55,7 @@ struct cached_font
     LOGFONTW              lf;
     XFORM                 xform;
     UINT                  aa_flags;
+    UINT                  scale;     /* raster scale of the glyphs */
     struct cached_glyph **glyphs[GLYPH_NBTYPES][GLYPH_CACHE_PAGES];
 };
 
@@ -541,6 +542,7 @@ static DWORD font_cache_hash( struct cached_font *font )
     int i;
 
     hash ^= font->aa_flags;
+    hash ^= font->scale;
     for(i = 0, ptr = (DWORD*)&font->xform; i < sizeof(XFORM)/sizeof(DWORD); i++, ptr++)
         hash ^= *ptr;
     for(i = 0, ptr = (DWORD*)&font->lf; i < 7; i++, ptr++)
@@ -562,13 +564,14 @@ static int font_cache_cmp( const struct cached_font *p1, const struct cached_fon
 {
     int ret = p1->hash - p2->hash;
     if (!ret) ret = p1->aa_flags - p2->aa_flags;
+    if (!ret) ret = p1->scale - p2->scale;
     if (!ret) ret = memcmp( &p1->xform, &p2->xform, sizeof(p1->xform) );
     if (!ret) ret = memcmp( &p1->lf, &p2->lf, FIELD_OFFSET( LOGFONTW, lfFaceName ));
     if (!ret) ret = wcsicmp( p1->lf.lfFaceName, p2->lf.lfFaceName );
     return ret;
 }
 
-static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags )
+static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags, UINT scale )
 {
     struct cached_font font, *ptr, *last_unused = NULL;
     UINT i = 0, j, k;
@@ -584,6 +587,7 @@ static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags )
     }
     font.lf.lfWidth = abs( font.lf.lfWidth );
     font.aa_flags = aa_flags;
+    font.scale = scale;
     font.hash = font_cache_hash( &font );
 
     pthread_mutex_lock( &font_cache_lock );
@@ -752,6 +756,53 @@ static const BYTE masks[8] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
 static const int padding[4] = {0, 3, 2, 1};
 
 /***********************************************************************
+ *         scale_glyph
+ *
+ * Scale a cached glyph by replicating each of its pixels into a block of
+ * scale x scale pixels, for drawing in raster coordinates.
+ */
+static struct cached_glyph *scale_glyph( const struct cached_glyph *glyph, int bit_count, UINT scale )
+{
+    const GLYPHMETRICS *metrics = &glyph->metrics;
+    UINT width = metrics->gmBlackBoxX, height = metrics->gmBlackBoxY, bpp = bit_count / 8;
+    UINT src_stride, stride, x, y, i;
+    struct cached_glyph *ret;
+    const BYTE *src;
+    BYTE *dst;
+
+    if (width > INT_MAX / 32 / scale || height > INT_MAX / scale ||
+        abs( metrics->gmCellIncX ) > SHRT_MAX / (int)scale ||
+        abs( metrics->gmCellIncY ) > SHRT_MAX / (int)scale)
+        return NULL;
+    src_stride = get_dib_stride( width, bit_count );
+    stride = get_dib_stride( width * scale, bit_count );
+    if (stride && height * scale > (INT_MAX - sizeof(*ret)) / stride) return NULL;
+
+    ret = calloc( 1, FIELD_OFFSET( struct cached_glyph, bits[height * scale * stride] ));
+    if (!ret) return NULL;
+
+    for (y = 0; y < height; y++)
+    {
+        src = glyph->bits + y * src_stride;
+        dst = ret->bits + y * scale * stride;
+        for (x = 0; x < width; x++)
+            for (i = 0; i < scale; i++)
+                memcpy( dst + (x * scale + i) * bpp, src + x * bpp, bpp );
+        for (i = 1; i < scale; i++)
+            memcpy( dst + i * stride, dst, stride );
+    }
+
+    ret->metrics = *metrics;
+    ret->metrics.gmBlackBoxX = width * scale;
+    ret->metrics.gmBlackBoxY = height * scale;
+    ret->metrics.gmptGlyphOrigin.x *= (int)scale;
+    ret->metrics.gmptGlyphOrigin.y *= (int)scale;
+    ret->metrics.gmCellIncX *= (int)scale;
+    ret->metrics.gmCellIncY *= (int)scale;
+    return ret;
+}
+
+/***********************************************************************
  *         cache_glyph_bitmap
  *
  * Retrieve a 17-level bitmap for the appropriate glyph.
@@ -769,15 +820,22 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
     BYTE *dst, *src;
     int pad = 0, stride, bit_count;
     GLYPHMETRICS metrics;
-    struct cached_glyph *glyph;
+    struct cached_glyph *glyph, *scaled;
+    /* raster scaled glyphs are rendered by the render font of the DC, if any,
+     * otherwise the unscaled glyphs are replicated */
+    BOOL render = font->scale > 1 && dc_has_render_font( dc );
+    BOOL replicate = font->scale > 1 && !render;
 
     if (flags & ETO_GLYPH_INDEX) ggo_flags |= GGO_GLYPH_INDEX;
     indices[0] = index;
     for (i = 0; i < ARRAY_SIZE( indices ); i++)
     {
         index = indices[i];
-        ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, 0, NULL,
-                                    &identity, FALSE );
+        if (render)
+            ret = get_render_glyph_outline( dc, index, ggo_flags, &metrics, 0, NULL );
+        else
+            ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, 0, NULL,
+                                        &identity, FALSE );
         if (ret != GDI_ERROR) break;
     }
     if (ret == GDI_ERROR) return NULL;
@@ -792,8 +850,11 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
 
     if (bit_count == 8) pad = padding[ metrics.gmBlackBoxX % 4 ];
 
-    ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, size, glyph->bits,
-                                &identity, FALSE );
+    if (render)
+        ret = get_render_glyph_outline( dc, index, ggo_flags, &metrics, size, glyph->bits );
+    else
+        ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, size, glyph->bits,
+                                    &identity, FALSE );
     if (ret == GDI_ERROR)
     {
         free( glyph );
@@ -821,6 +882,12 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
 
 done:
     glyph->metrics = metrics;
+    if (replicate)
+    {
+        scaled = scale_glyph( glyph, bit_count, font->scale );
+        free( glyph );
+        if (!(glyph = scaled)) return NULL;
+    }
     return add_cached_glyph( font, index, flags, glyph );
 }
 
@@ -901,7 +968,8 @@ BOOL render_aa_text_bitmapinfo( DC *dc, BITMAPINFO *info, struct gdi_image_bits 
         dib.funcs->solid_rects( &dib, 1, &src->visrect, bkgnd_color.and, bkgnd_color.xor );
     }
 
-    if (!(font = add_cached_font( dc, dc->hFont, aa_flags ))) return FALSE;
+    /* the coordinates are those of the bits, which are not raster scaled */
+    if (!(font = add_cached_font( dc, dc->hFont, aa_flags, 1 ))) return FALSE;
 
     render_string( dc, &dib, font, x, y, flags, str, count, dx, &visrect, NULL );
     release_cached_font( font );
@@ -917,9 +985,31 @@ BOOL dibdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
     dibdrv_physdev *pdev = get_dibdrv_pdev(dev);
     DC *dc = get_physdev_dc( dev );
     struct clipped_rects clipped_rects;
-    RECT bounds;
+    RECT bounds, raster_rect;
+    INT *raster_dx = NULL;
+    UINT i, scale = dc->gdi_scale;
 
     if (!pdev->font) return FALSE;
+
+    if (scale > 1)
+    {
+        /* the coordinates are in device units, draw in raster coordinates */
+        x = scale_device_coord( x, scale );
+        y = scale_device_coord( y, scale );
+        if (rect && (flags & (ETO_OPAQUE | ETO_CLIPPED)))
+        {
+            raster_rect = scale_rect( *rect, scale );
+            rect = &raster_rect;
+        }
+        if (dx && count)
+        {
+            UINT dx_count = (flags & ETO_PDY) ? count * 2 : count;
+
+            if (!(raster_dx = malloc( dx_count * sizeof(*raster_dx) ))) return FALSE;
+            for (i = 0; i < dx_count; i++) raster_dx[i] = scale_device_coord( dx[i], scale );
+            dx = raster_dx;
+        }
+    }
 
     init_clipped_rects( &clipped_rects );
     reset_bounds( &bounds );
@@ -954,6 +1044,7 @@ BOOL dibdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
 done:
     add_clipped_bounds( pdev, &bounds, pdev->clip );
     free_clipped_rects( &clipped_rects );
+    free( raster_dx );
     return TRUE;
 }
 
@@ -973,7 +1064,7 @@ HFONT dibdrv_SelectFont( PHYSDEV dev, HFONT font, UINT *aa_flags )
     if (ret)
     {
         struct cached_font *prev = pdev->font;
-        pdev->font = add_cached_font( dc, font, *aa_flags ? *aa_flags : GGO_BITMAP );
+        pdev->font = add_cached_font( dc, font, *aa_flags ? *aa_flags : GGO_BITMAP, dc->gdi_scale );
         release_cached_font( prev );
     }
     return ret;
