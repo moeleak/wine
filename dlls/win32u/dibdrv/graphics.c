@@ -56,6 +56,7 @@ struct cached_font
     XFORM                 xform;
     UINT                  aa_flags;
     UINT                  scale;     /* raster scale of the glyphs */
+    BOOL                  linear;    /* grayscale glyphs with linear coverage, see use_linear_coverage */
     struct cached_glyph **glyphs[GLYPH_NBTYPES][GLYPH_CACHE_PAGES];
 };
 
@@ -543,6 +544,7 @@ static DWORD font_cache_hash( struct cached_font *font )
 
     hash ^= font->aa_flags;
     hash ^= font->scale;
+    hash ^= font->linear;
     for(i = 0, ptr = (DWORD*)&font->xform; i < sizeof(XFORM)/sizeof(DWORD); i++, ptr++)
         hash ^= *ptr;
     for(i = 0, ptr = (DWORD*)&font->lf; i < 7; i++, ptr++)
@@ -565,10 +567,36 @@ static int font_cache_cmp( const struct cached_font *p1, const struct cached_fon
     int ret = p1->hash - p2->hash;
     if (!ret) ret = p1->aa_flags - p2->aa_flags;
     if (!ret) ret = p1->scale - p2->scale;
+    if (!ret) ret = p1->linear - p2->linear;
     if (!ret) ret = memcmp( &p1->xform, &p2->xform, sizeof(p1->xform) );
     if (!ret) ret = memcmp( &p1->lf, &p2->lf, FIELD_OFFSET( LOGFONTW, lfFaceName ));
     if (!ret) ret = wcsicmp( p1->lf.lfFaceName, p2->lf.lfFaceName );
     return ret;
+}
+
+/***********************************************************************
+ *         use_linear_coverage
+ *
+ * The raster scaled glyphs of a render font that is hinted the way the host
+ * renders text are also blended the way the host blends grayscale text:
+ * with 256 coverage levels, linearly, instead of the 17 levels of the GDI
+ * ramp. They are cached as 32-bpp glyphs with the coverage in all three
+ * channels, so that draw_subpixel_glyph blends them.
+ */
+static BOOL use_linear_coverage( DC *dc, UINT aa_flags, UINT scale )
+{
+    if (scale <= 1) return FALSE;
+
+    switch (aa_flags)
+    {
+    case GGO_GRAY2_BITMAP:
+    case GGO_GRAY4_BITMAP:
+    case GGO_GRAY8_BITMAP:
+    case WINE_GGO_GRAY16_BITMAP:
+        return dc_has_host_hinted_render_font( dc );
+    default:
+        return FALSE;
+    }
 }
 
 static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags, UINT scale )
@@ -588,6 +616,7 @@ static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags, 
     font.lf.lfWidth = abs( font.lf.lfWidth );
     font.aa_flags = aa_flags;
     font.scale = scale;
+    font.linear = use_linear_coverage( dc, aa_flags, scale );
     font.hash = font_cache_hash( &font );
 
     pthread_mutex_lock( &font_cache_lock );
@@ -731,9 +760,11 @@ static void draw_glyph( dib_info *dib, int x, int y, const GLYPHMETRICS *metrics
     }
 }
 
-static int get_glyph_depth( UINT aa_flags )
+static int get_glyph_depth( const struct cached_font *font )
 {
-    switch (aa_flags)
+    if (font->linear) return 32;
+
+    switch (font->aa_flags)
     {
     case GGO_BITMAP: /* we'll convert non-antialiased 1-bpp bitmaps to 8-bpp */
     case GGO_GRAY2_BITMAP:
@@ -747,7 +778,7 @@ static int get_glyph_depth( UINT aa_flags )
     case WINE_GGO_VBGR_BITMAP: return 32;
 
     default:
-        ERR("Unexpected flags %08x\n", aa_flags);
+        ERR("Unexpected flags %08x\n", font->aa_flags);
         return 0;
     }
 }
@@ -844,10 +875,13 @@ static void center_scaled_glyph( DC *dc, UINT index, UINT ggo_flags, UINT scale,
  *
  * For non-antialiased bitmaps convert them to the 17-level format
  * using only values 0 or 16.
+ *
+ * For linear coverage, retrieve a 256-level bitmap and store each level
+ * in the three channels of a 32-bpp pixel.
  */
 static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font, UINT index, UINT flags )
 {
-    UINT ggo_flags = font->aa_flags;
+    UINT ggo_flags = font->linear ? WINE_GGO_GRAY16_BITMAP : font->aa_flags;
     static const MAT2 identity = { {0,1}, {0,0}, {0,0}, {0,1} };
     UINT indices[3] = {0, 0, 0x20};
     int i, x, y;
@@ -876,7 +910,7 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
     if (ret == GDI_ERROR) return NULL;
     if (!ret) metrics.gmBlackBoxX = metrics.gmBlackBoxY = 0; /* empty glyph */
 
-    bit_count = get_glyph_depth( font->aa_flags );
+    bit_count = get_glyph_depth( font );
     stride = get_dib_stride( metrics.gmBlackBoxX, bit_count );
     size = metrics.gmBlackBoxY * stride;
     glyph = malloc( FIELD_OFFSET( struct cached_glyph, bits[size] ));
@@ -909,6 +943,17 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
                 dst[x] = (src[x / 8] & masks[x % 8]) ? 0x10 : 0;
         }
     }
+    else if (font->linear)
+    {
+        for (y = metrics.gmBlackBoxY - 1; y >= 0; y--)
+        {
+            src = glyph->bits + y * get_dib_stride( metrics.gmBlackBoxX, 8 );
+            dst = glyph->bits + y * stride;
+
+            for (x = metrics.gmBlackBoxX - 1; x >= 0; x--)
+                ((DWORD *)dst)[x] = src[x] * 0x010101;
+        }
+    }
     else if (pad)
     {
         for (y = 0, dst = glyph->bits; y < metrics.gmBlackBoxY; y++, dst += stride)
@@ -937,7 +982,7 @@ static void render_string( DC *dc, dib_info *dib, struct cached_font *font, INT 
     DWORD text_color;
     struct font_intensities intensity;
 
-    glyph_dib.bit_count    = get_glyph_depth( font->aa_flags );
+    glyph_dib.bit_count    = get_glyph_depth( font );
     glyph_dib.rect.left    = 0;
     glyph_dib.rect.top     = 0;
     glyph_dib.bits.is_copy = FALSE;

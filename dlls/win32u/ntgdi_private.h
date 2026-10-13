@@ -364,6 +364,7 @@ extern int add_gdi_face( const WCHAR *family_name, const WCHAR *second_name,
 extern UINT font_init(void);
 extern const struct font_backend_funcs *init_freetype_lib(void);
 extern BOOL dc_has_render_font( DC *dc );
+extern BOOL dc_has_host_hinted_render_font( DC *dc );
 extern DWORD get_render_glyph_outline( DC *dc, UINT glyph, UINT format, GLYPHMETRICS *gm,
                                        DWORD buflen, void *buf );
 

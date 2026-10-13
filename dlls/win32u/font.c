@@ -4770,6 +4770,12 @@ static struct gdi_font *get_dc_render_font( DC *dc )
     return dev ? get_font_dev( dev )->render_font : NULL;
 }
 
+/* symbol fonts such as Marlett draw window elements, not text */
+static BOOL is_host_hinted_render_font( const struct gdi_font *font )
+{
+    return font->charset != SYMBOL_CHARSET;
+}
+
 /*************************************************************
  * dc_has_render_font
  *
@@ -4778,6 +4784,19 @@ static struct gdi_font *get_dc_render_font( DC *dc )
 BOOL dc_has_render_font( DC *dc )
 {
     return get_dc_render_font( dc ) != NULL;
+}
+
+/*************************************************************
+ * dc_has_host_hinted_render_font
+ *
+ * Whether the DC has a render font whose glyphs are hinted the way the host
+ * renders text, see get_render_glyph_outline.
+ */
+BOOL dc_has_host_hinted_render_font( DC *dc )
+{
+    struct gdi_font *font = get_dc_render_font( dc );
+
+    return font && is_host_hinted_render_font( font );
 }
 
 /*************************************************************
@@ -4800,8 +4819,7 @@ DWORD get_render_glyph_outline( DC *dc, UINT glyph, UINT format, GLYPHMETRICS *g
     DWORD ret;
 
     if (!font) return GDI_ERROR;
-    /* symbol fonts such as Marlett draw window elements, not text */
-    if (font->charset != SYMBOL_CHARSET) format |= WINE_GGO_HOST_HINTING;
+    if (is_host_hinted_render_font( font )) format |= WINE_GGO_HOST_HINTING;
     pthread_mutex_lock( &font_lock );
     ret = get_glyph_outline( font, glyph & 0xffff, format, gm, NULL, buflen, buf, NULL );
     pthread_mutex_unlock( &font_lock );
