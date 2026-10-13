@@ -1084,7 +1084,7 @@ static int remove_font( const WCHAR *file, DWORD flags )
         LIST_FOR_EACH_ENTRY_SAFE( face, face_next, &family->faces, struct gdi_font_face, entry )
         {
             if (!face->file) continue;
-            if (LOWORD(face->flags) != LOWORD(flags)) continue;
+            if (LOWORD( face->flags & ~ADDFONT_VAR_INSTANCE ) != LOWORD( flags )) continue;
             if (!wcsicmp( face->file, file ))
             {
                 TRACE( "removing matching face %s refcount %d\n", debugstr_w(face->file), face->refcount );
@@ -2474,6 +2474,8 @@ static struct gdi_font *create_gdi_font( const struct gdi_font_face *face, const
     font->scalable = face->scalable;
     font->face_index = face->face_index;
     font->ntmFlags = face->ntmFlags;
+    font->weight = face->weight;
+    font->var_instance = !!(face->flags & ADDFONT_VAR_INSTANCE);
     font->aa_flags = HIWORD( face->flags );
     if (!family_name) family_name = face->family->family_name;
     font->otm.otmpFamilyName = (char *)wcsdup( family_name );

@@ -293,6 +293,8 @@ struct gdi_font
     SHORT                  yMax;
     SHORT                  yMin;
     UINT                   ntmFlags;
+    UINT                   weight;             /* weight of the face */
+    BOOL                   var_instance;       /* face is a named instance of a variable font */
     UINT                   ntmAvgWidth;
     UINT                   aa_flags;
     ULONG                  ttc_item_offset;    /* 0 if font is not a part of TrueType collection */
@@ -327,6 +329,7 @@ struct gdi_font
 #define ADDFONT_ADD_RESOURCE  0x08  /* added through AddFontResource */
 #define ADDFONT_VERTICAL_FONT 0x10
 #define ADDFONT_EXTERNAL_FOUND 0x20
+#define ADDFONT_VAR_INSTANCE  0x40  /* face projected from a named instance of a variable font */
 #define ADDFONT_AA_FLAGS(flags) ((flags) << 16)
 
 /* private get_glyph_outline() format flag, never accepted from applications: hint the glyph the

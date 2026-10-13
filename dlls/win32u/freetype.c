@@ -3459,7 +3459,10 @@ static BOOL freetype_set_outline_text_metrics( struct gdi_font *font )
         TM.tmAveCharWidth = 1; 
     }
     TM.tmMaxCharWidth = SCALE_X(ft_face->bbox.xMax - ft_face->bbox.xMin);
-    TM.tmWeight = font->fake_bold ? FW_BOLD : pOS2->usWeightClass;
+    /* the OS/2 table of a variable font describes its default instance only */
+    if (font->fake_bold) TM.tmWeight = FW_BOLD;
+    else if (font->var_instance) TM.tmWeight = font->weight;
+    else TM.tmWeight = pOS2->usWeightClass;
 
     TM.tmOverhang = 0;
     TM.tmDigitizedAspectX = 96; /* FIXME */
@@ -3500,7 +3503,9 @@ static BOOL freetype_set_outline_text_metrics( struct gdi_font *font )
             TM.tmBreakChar = pOS2->usFirstCharIndex;
         TM.tmDefaultChar = TM.tmBreakChar - 1;
     }
-    TM.tmItalic = font->fake_italic ? 255 : ((ft_face->style_flags & FT_STYLE_FLAG_ITALIC) ? 255 : 0);
+    if (font->fake_italic) TM.tmItalic = 255;
+    else if (font->var_instance) TM.tmItalic = (font->ntmFlags & NTM_ITALIC) ? 255 : 0;
+    else TM.tmItalic = (ft_face->style_flags & FT_STYLE_FLAG_ITALIC) ? 255 : 0;
     TM.tmUnderlined = font->lf.lfUnderline ? 255 : 0;
     TM.tmStruckOut = font->lf.lfStrikeOut ? 255 : 0;
 
@@ -3581,6 +3586,14 @@ static BOOL freetype_set_outline_text_metrics( struct gdi_font *font )
     font->otm.otmFiller = 0;
     memcpy(&font->otm.otmPanoseNumber, pOS2->panose, PANOSE_COUNT);
     font->otm.otmfsSelection = pOS2->fsSelection;
+    if (font->var_instance)
+    {
+        /* replace the ITALIC, BOLD and REGULAR bits of the default instance */
+        font->otm.otmfsSelection &= ~((1 << 0) | (1 << 5) | (1 << 6));
+        if (font->ntmFlags & NTM_ITALIC) font->otm.otmfsSelection |= 1 << 0;
+        if (font->ntmFlags & NTM_BOLD) font->otm.otmfsSelection |= 1 << 5;
+        if (font->ntmFlags & NTM_REGULAR) font->otm.otmfsSelection |= 1 << 6;
+    }
     if (font->fake_italic)
         font->otm.otmfsSelection |= 1;
     if (font->fake_bold)
