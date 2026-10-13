@@ -6856,7 +6856,7 @@ static void update_external_font_keys(void)
     if (!(hkey = reg_create_key( wine_fonts_key, external_fontsW, sizeof(external_fontsW), 0, NULL )))
         return;
 
-    while (reg_enum_value( hkey, i++, info, sizeof(buffer), value, LF_FULLFACESIZE * sizeof(WCHAR) ))
+    while (reg_enum_value( hkey, i++, info, sizeof(buffer), value, sizeof(value) ))
     {
         if (info->Type != REG_SZ) continue;
 
@@ -6898,7 +6898,7 @@ static void update_external_font_keys(void)
             if (!(face->flags & ADDFONT_EXTERNAL_FONT)) continue;
             if ((face->flags & ADDFONT_EXTERNAL_FOUND)) continue;
 
-            lstrcpyW( value, face->full_name );
+            lstrcpynW( value, face->full_name, LF_FULLFACESIZE );
             if (face->scalable) lstrcatW( value, true_type_suffixW );
 
             if (face->file[0] == '\\')
