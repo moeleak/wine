@@ -4784,6 +4784,14 @@ BOOL dc_has_render_font( DC *dc )
  * get_render_glyph_outline
  *
  * Same as NtGdiGetGlyphOutline with an identity matrix, using the render font.
+ * Its glyphs are only drawn on raster scaled DCs and are never seen by
+ * applications, which get the metrics and outlines of the unscaled font. So
+ * they are hinted the way the host renders text (WINE_GGO_HOST_HINTING),
+ * except for symbol fonts. gm describes the returned bits, including the
+ * render glyph's own advance, which is not scale times the unscaled advance.
+ * Code that places the glyph in the unscaled layout, such as
+ * center_scaled_glyph, has to use this gm and never GGO_METRICS of the render
+ * font, which is hinted differently.
  */
 DWORD get_render_glyph_outline( DC *dc, UINT glyph, UINT format, GLYPHMETRICS *gm,
                                 DWORD buflen, void *buf )
@@ -4792,6 +4800,8 @@ DWORD get_render_glyph_outline( DC *dc, UINT glyph, UINT format, GLYPHMETRICS *g
     DWORD ret;
 
     if (!font) return GDI_ERROR;
+    /* symbol fonts such as Marlett draw window elements, not text */
+    if (font->charset != SYMBOL_CHARSET) format |= WINE_GGO_HOST_HINTING;
     pthread_mutex_lock( &font_lock );
     ret = get_glyph_outline( font, glyph & 0xffff, format, gm, NULL, buflen, buf, NULL );
     pthread_mutex_unlock( &font_lock );
