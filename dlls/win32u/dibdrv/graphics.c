@@ -803,6 +803,41 @@ static struct cached_glyph *scale_glyph( const struct cached_glyph *glyph, int b
 }
 
 /***********************************************************************
+ *         center_scaled_glyph
+ *
+ * Raster scaled glyphs are placed at scale times the advances of the
+ * unscaled glyphs, which are hinted at a different size. Center a scaled
+ * glyph on its scaled advance instead of leaving all the difference on its
+ * right, without moving its ink further out of that cell than it already is.
+ */
+static void center_scaled_glyph( DC *dc, UINT index, UINT ggo_flags, UINT scale, GLYPHMETRICS *metrics )
+{
+    static const MAT2 identity = { {0,1}, {0,0}, {0,0}, {0,1} };
+    int cell, slack, offset, left, right;
+    GLYPHMETRICS gm;
+
+    /* same metrics as the advances that ExtTextOut passes on raster scaled DCs */
+    if (NtGdiGetGlyphOutline( dc->hSelf, index, GGO_METRICS | (ggo_flags & GGO_GLYPH_INDEX), &gm, 0, NULL,
+                              &identity, FALSE ) == GDI_ERROR)
+        return;
+    if (gm.gmCellIncY || metrics->gmCellIncY) return;
+    if (gm.gmCellIncX <= 0 || gm.gmCellIncX > SHRT_MAX / (int)scale) return;
+
+    cell = (int)scale * gm.gmCellIncX;
+    if (metrics->gmBlackBoxX)
+    {
+        slack = cell - metrics->gmCellIncX;
+        offset = slack >= 0 ? (slack + 1) / 2 : -(-slack / 2);
+        left = metrics->gmptGlyphOrigin.x;
+        right = cell - left - (int)metrics->gmBlackBoxX;
+        offset = max( offset, min( 0, -left ));
+        offset = min( offset, max( 0, right ));
+        metrics->gmptGlyphOrigin.x += offset;
+    }
+    metrics->gmCellIncX = cell;
+}
+
+/***********************************************************************
  *         cache_glyph_bitmap
  *
  * Retrieve a 17-level bitmap for the appropriate glyph.
@@ -888,6 +923,7 @@ done:
         free( glyph );
         if (!(glyph = scaled)) return NULL;
     }
+    if (font->scale > 1) center_scaled_glyph( dc, index, ggo_flags, font->scale, &glyph->metrics );
     return add_cached_glyph( font, index, flags, glyph );
 }
 
