@@ -45,9 +45,11 @@ extern HICON create_small_icon( HICON handle );
 
 /* dce.c */
 extern struct window_surface dummy_surface;
-extern void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, struct ratio monitor_dpi,
-                                   struct window_surface **window_surface );
+extern void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, UINT scale,
+                                   struct ratio monitor_dpi, struct window_surface **window_surface );
 extern struct window_surface *get_driver_window_surface( struct window_surface *surface, struct ratio monitor_dpi );
+extern UINT get_window_surface_scale( struct window_surface *surface );
+extern BOOL can_reuse_window_surface( struct window_surface *surface, const RECT *surface_rect, UINT scale );
 extern void erase_now( HWND hwnd, UINT rdw_flags );
 extern void flush_window_surfaces( BOOL idle );
 extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects );

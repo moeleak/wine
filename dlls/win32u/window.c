@@ -2179,7 +2179,7 @@ static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, str
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
 
-    if ((previous = win->surface) && EqualRect( &previous->rect, surface_rect ))
+    if ((previous = win->surface) && can_reuse_window_surface( previous, surface_rect, 1 ))
     {
         window_surface_add_ref( (*surface = previous) );
         TRACE( "trying to reuse previous surface %p\n", previous );
@@ -2249,7 +2249,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else if (create_layered || is_layered) needs_surface = TRUE;
 
     if (needs_surface)
-        create_window_surface( hwnd, create_layered, surface_rect, raw_dpi, &new_surface );
+        create_window_surface( hwnd, create_layered, surface_rect, 1, raw_dpi, &new_surface );
     else if (new_surface && new_surface != &dummy_surface)
     {
         window_surface_release( new_surface );
