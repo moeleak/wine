@@ -2185,14 +2185,17 @@ static BOOL get_surface_rect( const RECT *visible_rect, RECT *surface_rect )
 /* pixel scale of the window surface of a toplevel window, its window DCs are rasterized at that scale */
 static UINT get_window_gdi_scale( HWND hwnd, struct ratio eff_dpi, UINT ex_style, BOOL create_layered )
 {
-    UINT context;
+    UINT context, dpi;
 
     /* layered window surfaces are never scaled */
     if (create_layered || (ex_style & WS_EX_LAYERED)) return 1;
     context = get_window_dpi_awareness_context( hwnd );
     if (!(NTUSER_DPI_CONTEXT_GET_FLAGS( context ) & NTUSER_DPI_CONTEXT_FLAG_GDISCALED)) return 1;
     if (gdi_scale_override) return gdi_scale_override;
-    return 1;
+
+    /* round the monitor scale up to an integer, ignoring up to 1/8, the surface flush scales the rest */
+    if ((dpi = round_dpi( eff_dpi )) <= 108) return 1;
+    return min( 4, (dpi - 12 + 95) / 96 );
 }
 
 static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, UINT scale,
