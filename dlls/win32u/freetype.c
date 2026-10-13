@@ -972,6 +972,79 @@ static UINT split_style_words( const WCHAR *subfamily, WCHAR *family, WCHAR *sec
     return style;
 }
 
+/* check whether a name is made only of the words Regular, Bold, Italic and Oblique, and get its style bits */
+static BOOL get_ribbi_style( const WCHAR *name, UINT *style )
+{
+    static const WCHAR regularW[] = {'R','e','g','u','l','a','r',0};
+    static const WCHAR boldW[] = {'B','o','l','d',0};
+    static const WCHAR italicW[] = {'I','t','a','l','i','c',0};
+    static const WCHAR obliqueW[] = {'O','b','l','i','q','u','e',0};
+    const WCHAR *word = name;
+    UINT len;
+
+    *style = 0;
+    for (;;)
+    {
+        while (*word == ' ') word++;
+        if (!*word) break;
+        len = 0;
+        while (word[len] && word[len] != ' ') len++;
+
+        if (is_word( word, len, boldW )) *style |= STYLE_BOLD;
+        else if (is_word( word, len, italicW ) || is_word( word, len, obliqueW )) *style |= STYLE_ITALIC;
+        else if (!is_word( word, len, regularW )) return FALSE;
+        word += len;
+    }
+    return TRUE;
+}
+
+/* Like DirectWrite, fit a named instance into a legacy family of four styles using the STAT axis value
+ * names of the instance: the names made only of the words Regular, Bold, Italic and Oblique select its
+ * style in the family, and the other names are appended to the family names in their languages. The
+ * names are classified by their English strings, fails if one of them has none. */
+static BOOL split_stat_labels( const struct tt_name_v0 *tt_name_v0, const struct opentype_var_instance *instance,
+                               const struct family_names_data *family_names, WCHAR *family, WCHAR *second,
+                               UINT size, UINT *style )
+{
+    WCHAR *english[ARRAY_SIZE(instance->label_name_ids)], *str;
+    UINT i, count, label_style;
+    const WCHAR *name;
+    BOOL ret;
+
+    if (!instance->stat_valid) return FALSE;
+    for (count = 0; count < instance->label_count; count++)
+    {
+        english[count] = get_opentype_name( tt_name_v0, instance->label_name_ids[count],
+                                            MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT) );
+        if (!english[count]) break;
+    }
+
+    if ((ret = count == instance->label_count))
+    {
+        *style = 0;
+        for (i = 0; i < count; i++)
+        {
+            if (get_ribbi_style( english[i], &label_style ))
+            {
+                *style |= label_style;
+                continue;
+            }
+            str = get_opentype_name( tt_name_v0, instance->label_name_ids[i], family_names->family_langid );
+            name = str ? str : english[i];
+            append_name( family, size, name, lstrlenW( name ) );
+            free( str );
+            if (!second[0]) continue;
+            str = get_opentype_name( tt_name_v0, instance->label_name_ids[i], family_names->second_langid );
+            name = str ? str : english[i];
+            append_name( second, size, name, lstrlenW( name ) );
+            free( str );
+        }
+    }
+
+    for (i = 0; i < count; i++) free( english[i] );
+    return ret;
+}
+
 /* check that FreeType loads the named instances of a variable font from bits 16-30 of the face index */
 static BOOL ft_face_has_named_instances( void *data_ptr, UINT data_size, UINT subfont, UINT count )
 {
@@ -1035,6 +1108,7 @@ static BOOL unix_face_set_var_instance( struct unix_face *This, const void *data
     struct opentype_var_instance instance;
     UINT style, family_len, second_len, max_len;
     USHORT subfamily_id;
+    BOOL from_stat;
 
     if (!opentype_get_var_instance( data, size, ttc_sfnt_v1, index, &instance )) return FALSE;
     if (instance.is_duplicate)
@@ -1076,12 +1150,17 @@ static BOOL unix_face_set_var_instance( struct unix_face *This, const void *data
 
     family_len = lstrlenW( family );
     second_len = lstrlenW( second );
-    if ((str = get_opentype_name( tt_name_v0, subfamily_id, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT) )))
+    if (!(from_stat = split_stat_labels( tt_name_v0, &instance, &family_names, family, second,
+                                         ARRAY_SIZE(family), &style )))
     {
-        style = split_style_words( str, family, second, ARRAY_SIZE(family) );
-        free( str );
+        WARN( "STAT does not describe instance %u of %s, using its fvar name\n", index, debugstr_w(family) );
+        if ((str = get_opentype_name( tt_name_v0, subfamily_id, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT) )))
+        {
+            style = split_style_words( str, family, second, ARRAY_SIZE(family) );
+            free( str );
+        }
+        else style = split_style_words( subfamily, family, second, ARRAY_SIZE(family) );
     }
-    else style = split_style_words( subfamily, family, second, ARRAY_SIZE(family) );
     free( subfamily );
 
     /* family names are cut to LF_FACESIZE - 1 characters, one less for the vertical families of DBCS
@@ -1114,9 +1193,9 @@ static BOOL unix_face_set_var_instance( struct unix_face *This, const void *data
     This->var_instance = TRUE;
     This->is_default_instance = instance.is_default;
 
-    TRACE( "instance %u: family %s, second %s, style %s, full %s, weight %u, ntm %#x, named from fvar\n",
+    TRACE( "instance %u: family %s, second %s, style %s, full %s, weight %u, ntm %#x, named from %s\n",
            index, debugstr_w(This->family_name), debugstr_w(This->second_name), debugstr_w(This->style_name),
-           debugstr_w(This->full_name), This->weight, This->ntm_flags );
+           debugstr_w(This->full_name), This->weight, This->ntm_flags, from_stat ? "STAT" : "fvar" );
     return TRUE;
 }
 

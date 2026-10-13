@@ -52,9 +52,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(font);
 #define MS_ITAL_TAG MS_MAKE_TAG('i','t','a','l')
 #define MS_SLNT_TAG MS_MAKE_TAG('s','l','n','t')
 
-/* limits on the variable fonts whose named instances are exposed */
+/* limits on the variable fonts whose named instances are exposed, and on the STAT tables naming them */
 #define MAX_VAR_AXES      64
 #define MAX_VAR_INSTANCES 256
+#define MAX_STAT_AXES     32
+#define MAX_STAT_VALUES   1024
 
 #ifdef WORDS_BIGENDIAN
 #define GET_BE_WORD(x) (x)
@@ -217,7 +219,27 @@ struct tt_stat_axis
     WORD axisNameID;
     WORD axisOrdering;
 };
+
+struct tt_stat_axis_value
+{
+    WORD format;
+    WORD axisIndex;      /* axisCount in format 4 */
+    WORD flags;
+    WORD valueNameID;
+    DWORD value;         /* nominalValue in format 2, the first axis value record in format 4 */
+    DWORD rangeMinValue; /* linkedValue in format 3 */
+    DWORD rangeMaxValue;
+};
+
+struct tt_stat_axis_value_record
+{
+    WORD axisIndex;
+    DWORD value;
+};
 #pragma pack(pop)
+
+#define STAT_OLDER_SIBLING_FONT_ATTRIBUTE 0x0001
+#define STAT_ELIDABLE_AXIS_VALUE_NAME     0x0002
 
 enum OPENTYPE_PLATFORM_ID
 {
@@ -842,6 +864,8 @@ struct opentype_var_font
     UINT instance_size;
     UINT record_count;    /* number of named instance records in fvar */
     UINT instance_count;  /* number of exposed named instances, the first records */
+    const struct tt_stat_header *stat;
+    UINT32 stat_size;
 };
 
 static BOOL opentype_get_var_font( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
@@ -915,6 +939,8 @@ static BOOL opentype_get_var_font( const void *data, size_t size, const struct t
     var->axes = (const struct tt_fvar_axis *)((const BYTE *)fvar + axes_offset);
     var->instances = (const BYTE *)(var->axes + var->axis_count);
     var->instance_count = min( var->record_count, MAX_VAR_INSTANCES );
+    var->stat = stat;
+    var->stat_size = stat_size;
     return TRUE;
 }
 
@@ -937,6 +963,177 @@ static BOOL var_coords_equal( const struct opentype_var_font *var, UINT index, U
 
     for (i = 0; i < var->axis_count; i++)
         if (var_get_coord( var, index, i ) != var_get_coord( var, other, i )) return FALSE;
+    return TRUE;
+}
+
+static const struct tt_stat_axis *stat_get_design_axis( const struct opentype_var_font *var, UINT axis )
+{
+    const BYTE *axes = (const BYTE *)var->stat + GET_BE_DWORD( var->stat->designAxesOffset );
+    return (const struct tt_stat_axis *)(axes + axis * GET_BE_WORD( var->stat->designAxisSize ));
+}
+
+static UINT stat_axis_ordering( const struct opentype_var_font *var, UINT axis )
+{
+    return GET_BE_WORD( stat_get_design_axis( var, axis )->axisOrdering );
+}
+
+/* the axis value table k of STAT, NULL if it is invalid or only meant for older fonts of the family */
+static const struct tt_stat_axis_value *stat_get_axis_value( const struct opentype_var_font *var, UINT k )
+{
+    UINT32 offsets = GET_BE_DWORD( var->stat->offsetToAxisValueOffsets );
+    const WORD *offset_array = (const WORD *)((const BYTE *)var->stat + offsets);
+    UINT64 offset = (UINT64)offsets + GET_BE_WORD( offset_array[k] );
+    const struct tt_stat_axis_value *value;
+    UINT value_size;
+
+    if (offset + offsetof( struct tt_stat_axis_value, value ) > var->stat_size) return NULL;
+    value = (const struct tt_stat_axis_value *)((const BYTE *)var->stat + offset);
+    switch (GET_BE_WORD( value->format ))
+    {
+    case 1: value_size = offsetof( struct tt_stat_axis_value, rangeMinValue ); break;
+    case 2: value_size = sizeof(struct tt_stat_axis_value); break;
+    case 3: value_size = offsetof( struct tt_stat_axis_value, rangeMaxValue ); break;
+    case 4:
+        value_size = offsetof( struct tt_stat_axis_value, value ) +
+                     GET_BE_WORD( value->axisIndex ) * sizeof(struct tt_stat_axis_value_record);
+        break;
+    default: return NULL;
+    }
+    if (offset + value_size > var->stat_size) return NULL;
+    if (GET_BE_WORD( value->flags ) & STAT_OLDER_SIBLING_FONT_ATTRIBUTE) return NULL;
+    return value;
+}
+
+struct stat_label
+{
+    UINT ordering;
+    WORD name_id;
+    WORD flags;
+};
+
+/* insert the name of an axis value into the labels sorted by axis ordering */
+static BOOL stat_add_label( struct stat_label *labels, UINT *count, UINT ordering,
+                            const struct tt_stat_axis_value *value )
+{
+    UINT i;
+
+    if (*count == MAX_STAT_AXES) return FALSE;
+    for (i = *count; i > 0 && labels[i - 1].ordering > ordering; i--) labels[i] = labels[i - 1];
+    labels[i].ordering = ordering;
+    labels[i].name_id = GET_BE_WORD( value->valueNameID );
+    labels[i].flags = GET_BE_WORD( value->flags );
+    (*count)++;
+    return TRUE;
+}
+
+/* Like DirectWrite, name a named instance, or the default instance for index 0, with the STAT axis
+ * values of its coordinates in axis ordering, leaving out the elidable ones. Fails if a variation axis
+ * has no design axis, or if its value has no name. */
+static BOOL stat_get_instance_labels( const struct opentype_var_font *var, UINT index,
+                                      struct opentype_var_instance *instance )
+{
+    UINT design_count = GET_BE_WORD( var->stat->designAxisCount );
+    UINT value_count = GET_BE_WORD( var->stat->axisValueCount );
+    const struct tt_stat_axis_value_record *record;
+    const struct tt_stat_axis_value *value;
+    struct stat_label labels[MAX_STAT_AXES];
+    BOOL covered[MAX_STAT_AXES] = {0}, described[MAX_VAR_AXES] = {0};
+    int fvar_axis[MAX_STAT_AXES];
+    UINT i, j, k, count, label_count = 0;
+
+    if (design_count > MAX_STAT_AXES || value_count > MAX_STAT_VALUES)
+    {
+        TRACE( "ignoring STAT table with %u design axes and %u axis values\n", design_count, value_count );
+        return FALSE;
+    }
+
+    for (i = 0; i < design_count; i++)
+    {
+        DWORD tag = stat_get_design_axis( var, i )->axisTag;
+
+        fvar_axis[i] = -1;
+        for (j = 0; j < var->axis_count && fvar_axis[i] < 0; j++)
+            if (var->axes[j].axisTag == tag) fvar_axis[i] = j;
+        if (fvar_axis[i] >= 0) described[fvar_axis[i]] = TRUE;
+    }
+
+    /* instances that differ only on an axis STAT doesn't describe would get the same names */
+    for (j = 0; j < var->axis_count; j++)
+    {
+        if (described[j]) continue;
+        TRACE( "no STAT design axis for %s\n", debugstr_fourcc( var->axes[j].axisTag ) );
+        return FALSE;
+    }
+
+    /* format 4 values name a combination of axis values, and take precedence */
+    for (k = 0; k < value_count; k++)
+    {
+        UINT ordering = ~0u;
+        BOOL match = TRUE;
+
+        if (!(value = stat_get_axis_value( var, k )) || GET_BE_WORD( value->format ) != 4) continue;
+        /* there is at most one record for each design axis */
+        if (!(count = GET_BE_WORD( value->axisIndex )) || count > design_count) continue;
+        record = (const struct tt_stat_axis_value_record *)&value->value;
+        for (j = 0; j < count && match; j++)
+        {
+            UINT axis = GET_BE_WORD( record[j].axisIndex );
+
+            if (axis >= design_count || fvar_axis[axis] < 0 || covered[axis] ||
+                var_get_coord( var, index, fvar_axis[axis] ) != (INT32)GET_BE_DWORD( record[j].value ))
+                match = FALSE;
+            else ordering = min( ordering, stat_axis_ordering( var, axis ) );
+        }
+        if (!match) continue;
+        for (j = 0; j < count; j++) covered[GET_BE_WORD( record[j].axisIndex )] = TRUE;
+        if (!stat_add_label( labels, &label_count, ordering, value )) return FALSE;
+    }
+
+    for (i = 0; i < design_count; i++)
+    {
+        const struct tt_stat_axis_value *exact = NULL, *range = NULL, *single = NULL;
+        UINT format, candidates = 0;
+        INT32 coord = 0;
+
+        if (covered[i]) continue;
+        if (fvar_axis[i] >= 0) coord = var_get_coord( var, index, fvar_axis[i] );
+        for (k = 0; k < value_count; k++)
+        {
+            if (!(value = stat_get_axis_value( var, k ))) continue;
+            if ((format = GET_BE_WORD( value->format )) == 4 || GET_BE_WORD( value->axisIndex ) != i) continue;
+            candidates++;
+            single = value;
+            if (fvar_axis[i] < 0) continue;
+            /* the value of format 1 and 3, the nominal value of format 2 */
+            if ((INT32)GET_BE_DWORD( value->value ) == coord)
+            {
+                if (!exact) exact = value;
+            }
+            else if (format == 2 && !range && (INT32)GET_BE_DWORD( value->rangeMinValue ) <= coord &&
+                     coord <= (INT32)GET_BE_DWORD( value->rangeMaxValue ))
+                range = value;
+        }
+
+        if (fvar_axis[i] >= 0)
+        {
+            if (!(value = exact ? exact : range))
+            {
+                TRACE( "no STAT axis value for %s %#x\n", debugstr_fourcc( var->axes[fvar_axis[i]].axisTag ), coord );
+                return FALSE;
+            }
+        }
+        /* an axis that does not vary describes the whole font, e.g. the ital axis of an Italic font */
+        else if (candidates == 1) value = single;
+        else continue;
+        if (!stat_add_label( labels, &label_count, stat_axis_ordering( var, i ), value )) return FALSE;
+    }
+
+    for (i = 0; i < label_count; i++)
+    {
+        if (labels[i].flags & STAT_ELIDABLE_AXIS_VALUE_NAME) continue;
+        if (instance->label_count == ARRAY_SIZE(instance->label_name_ids)) return FALSE;
+        instance->label_name_ids[instance->label_count++] = labels[i].name_id;
+    }
     return TRUE;
 }
 
@@ -988,5 +1185,8 @@ BOOL opentype_get_var_instance( const void *data, size_t size, const struct ttc_
             instance->has_slant_axis = TRUE;
     }
 
+    /* duplicate instances are not exposed, and need no name */
+    if (instance->is_duplicate) return TRUE;
+    if (!(instance->stat_valid = stat_get_instance_labels( &var, index, instance ))) instance->label_count = 0;
     return TRUE;
 }

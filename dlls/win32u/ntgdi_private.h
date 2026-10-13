@@ -415,6 +415,9 @@ struct opentype_var_instance
     UINT weight;               /* rounded wght coordinate, 0 if the font has no wght axis */
     BOOL has_slant_axis;       /* the font has an ital or slnt axis */
     BOOL italic;               /* the ital coordinate is at least 0.5 */
+    BOOL stat_valid;           /* STAT names the instance with the axis value names below */
+    UINT label_count;          /* number of non-elidable STAT axis value names */
+    USHORT label_name_ids[8];  /* their name IDs, in axis ordering */
 };
 
 extern BOOL opentype_get_var_info( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
