@@ -2138,7 +2138,8 @@ static BOOL freetype_load_font( struct gdi_font *font )
         if (font->ppem == 0) font->ppem = calc_ppem_for_height( ft_face, font->lf.lfHeight );
         TRACE( "height %d => ppem %d\n", font->lf.lfHeight, font->ppem );
         height = font->ppem;
-        font->ttc_item_offset = get_ttc_offset( ft_face, font->face_index );
+        /* bits 16-30 of face_index select a named instance of a variable font */
+        font->ttc_item_offset = get_ttc_offset( ft_face, LOWORD( font->face_index ) );
         font->otm.otmEMSquare = ft_face->units_per_EM;
     }
     else
