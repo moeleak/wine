@@ -43,6 +43,18 @@ WINE_DEFAULT_DEBUG_CHANNEL(font);
 #define MS_CBDT_TAG MS_MAKE_TAG('C','B','D','T')
 #define MS_NAME_TAG MS_MAKE_TAG('n','a','m','e')
 #define MS_CFF__TAG MS_MAKE_TAG('C','F','F',' ')
+#define MS_CFF2_TAG MS_MAKE_TAG('C','F','F','2')
+#define MS_FVAR_TAG MS_MAKE_TAG('f','v','a','r')
+#define MS_GLYF_TAG MS_MAKE_TAG('g','l','y','f')
+#define MS_GVAR_TAG MS_MAKE_TAG('g','v','a','r')
+#define MS_STAT_TAG MS_MAKE_TAG('S','T','A','T')
+#define MS_WGHT_TAG MS_MAKE_TAG('w','g','h','t')
+#define MS_ITAL_TAG MS_MAKE_TAG('i','t','a','l')
+#define MS_SLNT_TAG MS_MAKE_TAG('s','l','n','t')
+
+/* limits on the variable fonts whose named instances are exposed */
+#define MAX_VAR_AXES      64
+#define MAX_VAR_INSTANCES 256
 
 #ifdef WORDS_BIGENDIAN
 #define GET_BE_WORD(x) (x)
@@ -157,6 +169,53 @@ struct tt_head
     SHORT direction_hint;
     SHORT index_format;
     SHORT glyphdata_format;
+};
+
+struct tt_fvar_header
+{
+    DWORD version;
+    WORD axesArrayOffset;
+    WORD reserved;
+    WORD axisCount;
+    WORD axisSize;
+    WORD instanceCount;
+    WORD instanceSize;
+};
+
+struct tt_fvar_axis
+{
+    DWORD axisTag;
+    DWORD minValue;
+    DWORD defaultValue;
+    DWORD maxValue;
+    WORD flags;
+    WORD axisNameID;
+};
+
+struct tt_fvar_instance
+{
+    WORD subfamilyNameID;
+    WORD flags;
+    DWORD coordinates[1];
+    /* WORD postScriptNameID; optional */
+};
+
+struct tt_stat_header
+{
+    WORD majorVersion;
+    WORD minorVersion;
+    WORD designAxisSize;
+    WORD designAxisCount;
+    DWORD designAxesOffset;
+    WORD axisValueCount;
+    DWORD offsetToAxisValueOffsets;
+};
+
+struct tt_stat_axis
+{
+    DWORD axisTag;
+    WORD axisNameID;
+    WORD axisOrdering;
 };
 #pragma pack(pop)
 
@@ -765,5 +824,169 @@ BOOL opentype_get_properties( const void *data, size_t size, const struct ttc_sf
         flags |= NTM_PS_OPENTYPE;
 
     *ntm_flags = flags;
+    return TRUE;
+}
+
+/* like FreeType, treat zero-length tables as missing */
+static BOOL opentype_has_table( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1, UINT32 tag )
+{
+    UINT32 table_size = 1;
+    return opentype_get_table_ptr( data, size, ttc_sfnt_v1, tag, NULL, &table_size );
+}
+
+struct opentype_var_font
+{
+    const struct tt_fvar_axis *axes;
+    const BYTE *instances;
+    UINT axis_count;
+    UINT instance_size;
+    UINT record_count;    /* number of named instance records in fvar */
+    UINT instance_count;  /* number of exposed named instances, the first records */
+};
+
+static BOOL opentype_get_var_font( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                                   struct opentype_var_font *var )
+{
+    UINT32 fvar_size = sizeof(struct tt_fvar_header), stat_size = sizeof(struct tt_stat_header);
+    const struct tt_fvar_header *fvar;
+    const struct tt_stat_header *stat;
+    UINT axes_offset, design_axis_count, axis_value_count;
+
+    if (!opentype_get_table_ptr( data, size, ttc_sfnt_v1, MS_FVAR_TAG, (const void **)&fvar, &fvar_size ))
+        return FALSE;
+
+    /* use the same checks as FreeType, so that it accepts every named instance we expose */
+    axes_offset = GET_BE_WORD( fvar->axesArrayOffset );
+    var->axis_count = GET_BE_WORD( fvar->axisCount );
+    var->instance_size = GET_BE_WORD( fvar->instanceSize );
+    var->record_count = GET_BE_WORD( fvar->instanceCount );
+    if (GET_BE_DWORD( fvar->version ) != 0x00010000 ||
+        GET_BE_WORD( fvar->axisSize ) != sizeof(struct tt_fvar_axis) ||
+        !var->axis_count || var->axis_count > 0x3ffe ||
+        (var->instance_size != 4 + 4 * var->axis_count && var->instance_size != 6 + 4 * var->axis_count) ||
+        var->record_count > 0x7eff ||
+        axes_offset + (UINT64)sizeof(struct tt_fvar_axis) * var->axis_count +
+        (UINT64)var->instance_size * var->record_count > fvar_size)
+    {
+        WARN( "invalid fvar table\n" );
+        return FALSE;
+    }
+    if (!var->record_count)
+    {
+        TRACE( "no named instances\n" );
+        return FALSE;
+    }
+
+    /* FreeType has no named instances for Multiple Master CFF fonts, and before 2.13
+     * it ignores the fvar table of TrueType fonts that have no gvar table */
+    if (!(opentype_has_table( data, size, ttc_sfnt_v1, MS_GLYF_TAG ) &&
+          opentype_has_table( data, size, ttc_sfnt_v1, MS_GVAR_TAG )) &&
+        !opentype_has_table( data, size, ttc_sfnt_v1, MS_CFF2_TAG ))
+    {
+        TRACE( "no glyf and gvar tables, or CFF2 table\n" );
+        return FALSE;
+    }
+
+    if (var->axis_count > MAX_VAR_AXES)
+    {
+        WARN( "ignoring the named instances of a font with %u axes\n", var->axis_count );
+        return FALSE;
+    }
+
+    /* like DirectWrite, only expose the named instances of fonts with a usable STAT table */
+    if (!opentype_get_table_ptr( data, size, ttc_sfnt_v1, MS_STAT_TAG, (const void **)&stat, &stat_size ))
+    {
+        TRACE( "no STAT table\n" );
+        return FALSE;
+    }
+    design_axis_count = GET_BE_WORD( stat->designAxisCount );
+    axis_value_count = GET_BE_WORD( stat->axisValueCount );
+    if (GET_BE_WORD( stat->majorVersion ) != 1 ||
+        GET_BE_WORD( stat->designAxisSize ) < sizeof(struct tt_stat_axis) ||
+        !design_axis_count || !axis_value_count ||
+        GET_BE_DWORD( stat->designAxesOffset ) +
+        (UINT64)GET_BE_WORD( stat->designAxisSize ) * design_axis_count > stat_size ||
+        GET_BE_DWORD( stat->offsetToAxisValueOffsets ) + (UINT64)sizeof(WORD) * axis_value_count > stat_size)
+    {
+        TRACE( "unusable STAT table\n" );
+        return FALSE;
+    }
+
+    var->axes = (const struct tt_fvar_axis *)((const BYTE *)fvar + axes_offset);
+    var->instances = (const BYTE *)(var->axes + var->axis_count);
+    var->instance_count = min( var->record_count, MAX_VAR_INSTANCES );
+    return TRUE;
+}
+
+/* index is the 1-based record index, as in bits 16-30 of FreeType face indices */
+static const struct tt_fvar_instance *var_get_instance( const struct opentype_var_font *var, UINT index )
+{
+    return (const struct tt_fvar_instance *)(var->instances + (index - 1) * var->instance_size);
+}
+
+/* 16.16 user space coordinate of a named instance, or of the default instance for index 0 */
+static INT32 var_get_coord( const struct opentype_var_font *var, UINT index, UINT axis )
+{
+    if (!index) return GET_BE_DWORD( var->axes[axis].defaultValue );
+    return GET_BE_DWORD( var_get_instance( var, index )->coordinates[axis] );
+}
+
+static BOOL var_coords_equal( const struct opentype_var_font *var, UINT index, UINT other )
+{
+    UINT i;
+
+    for (i = 0; i < var->axis_count; i++)
+        if (var_get_coord( var, index, i ) != var_get_coord( var, other, i )) return FALSE;
+    return TRUE;
+}
+
+BOOL opentype_get_var_info( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                            struct opentype_var_info *info )
+{
+    struct opentype_var_font var;
+    UINT i;
+
+    if (!opentype_get_var_font( data, size, ttc_sfnt_v1, &var )) return FALSE;
+    if (var.instance_count < var.record_count)
+        WARN( "exposing only %u of %u named instances\n", var.instance_count, var.record_count );
+
+    info->instance_count = var.instance_count;
+    /* the first record at the default coordinates, like FreeType's default named instance */
+    info->default_instance = 0;
+    for (i = 1; i <= var.instance_count && !info->default_instance; i++)
+        if (var_coords_equal( &var, i, 0 )) info->default_instance = i;
+    return TRUE;
+}
+
+BOOL opentype_get_var_instance( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                                UINT index, struct opentype_var_instance *instance )
+{
+    struct opentype_var_font var;
+    INT32 coord;
+    UINT i;
+
+    memset( instance, 0, sizeof(*instance) );
+    if (!opentype_get_var_font( data, size, ttc_sfnt_v1, &var )) return FALSE;
+    if (index > var.instance_count) return FALSE;
+
+    if (index) instance->subfamily_name_id = GET_BE_WORD( var_get_instance( &var, index )->subfamilyNameID );
+    instance->is_default = var_coords_equal( &var, index, 0 );
+    for (i = 1; i < index && !instance->is_duplicate; i++)
+        instance->is_duplicate = var_coords_equal( &var, index, i );
+
+    for (i = 0; i < var.axis_count; i++)
+    {
+        coord = var_get_coord( &var, index, i );
+        if (var.axes[i].axisTag == MS_WGHT_TAG)
+            instance->weight = min( max( ((INT64)coord + 0x8000) >> 16, 1 ), 1000 );
+        else if (var.axes[i].axisTag == MS_ITAL_TAG)
+        {
+            instance->has_slant_axis = TRUE;
+            if (coord >= 0x8000) instance->italic = TRUE;
+        }
+        else if (var.axes[i].axisTag == MS_SLNT_TAG)
+            instance->has_slant_axis = TRUE;
+    }
+
     return TRUE;
 }

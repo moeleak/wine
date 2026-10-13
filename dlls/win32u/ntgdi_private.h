@@ -398,6 +398,27 @@ extern BOOL opentype_enum_names( const struct tt_name_v0 *tt_name_v0, USHORT nam
 extern BOOL opentype_get_properties( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
                                      DWORD *version, FONTSIGNATURE *fs, DWORD *ntm_flags, UINT *weight );
 
+struct opentype_var_info
+{
+    UINT instance_count;    /* number of named instances, numbered from 1 in fvar order */
+    UINT default_instance;  /* first named instance at the default coordinates, 0 if none */
+};
+
+struct opentype_var_instance
+{
+    USHORT subfamily_name_id;  /* fvar subfamilyNameID, 0 for the default instance (index 0) */
+    BOOL is_default;           /* the coordinates are the default ones */
+    BOOL is_duplicate;         /* the coordinates are those of an earlier named instance */
+    UINT weight;               /* rounded wght coordinate, 0 if the font has no wght axis */
+    BOOL has_slant_axis;       /* the font has an ital or slnt axis */
+    BOOL italic;               /* the ital coordinate is at least 0.5 */
+};
+
+extern BOOL opentype_get_var_info( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                                   struct opentype_var_info *info );
+extern BOOL opentype_get_var_instance( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                                       UINT index, struct opentype_var_instance *instance );
+
 /* gdiobj.c */
 extern HGDIOBJ alloc_gdi_handle( struct gdi_obj_header *obj, DWORD type,
                                  const struct gdi_obj_funcs *funcs );
