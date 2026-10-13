@@ -1334,10 +1334,10 @@ static void load_face_from_cache( HKEY hkey_family, struct gdi_font_family *fami
 
 static void load_font_list_from_cache(void)
 {
-    WCHAR buffer[4096];
+    WCHAR buffer[4096], family_name[LF_FACESIZE];
     KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
     KEY_NODE_INFORMATION *enum_info = (KEY_NODE_INFORMATION *)buffer;
-    DWORD family_index = 0, total_size;
+    DWORD family_index = 0, total_size, len;
     struct gdi_font_family *family;
     HKEY hkey_family;
     WCHAR *second_name = (WCHAR *)info->Data;
@@ -1349,10 +1349,15 @@ static void load_font_list_from_cache(void)
                                           enum_info->NameLength )))
             continue;
         TRACE( "opened family key %s\n", debugstr_wn(enum_info->Name, enum_info->NameLength / sizeof(WCHAR)) );
+        /* buffer is reused below, keep the family name */
+        len = min( enum_info->NameLength / sizeof(WCHAR), LF_FACESIZE - 1 );
+        memcpy( family_name, enum_info->Name, len * sizeof(WCHAR) );
+        family_name[len] = 0;
         if (!query_reg_value( hkey_family, NULL, info, sizeof(buffer) ))
             second_name[0] = 0;
 
-        family = create_family( buffer, second_name );
+        if ((family = find_family_from_name( family_name ))) family->refcount++;
+        else family = create_family( family_name, second_name );
 
         load_face_from_cache( hkey_family, family, buffer, sizeof(buffer), TRUE );
 
