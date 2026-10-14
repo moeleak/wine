@@ -2332,13 +2332,35 @@ static void source_virt_to_raw_ratio( struct source *source, UINT *num, UINT *de
 }
 
 /* display_lock must be held */
+static UINT source_get_dpi( struct source *source )
+{
+    const DEVMODEW *physical = &source->physical, *current = &source->current;
+    UINT dpi = source->dpi ? source->dpi : system_dpi, dpi_long, dpi_short;
+
+    if (!(source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) return dpi;
+    if (!current->dmPelsWidth || !current->dmPelsHeight) return dpi;
+    if (!physical->dmPelsWidth || !physical->dmPelsHeight) return dpi;
+
+    /* Like Windows, scale down the DPI of an emulated mode that is smaller than the physical mode, so
+     * that a fullscreen application using a low resolution mode isn't DPI scaled. Keep the physical
+     * size of the scale, in steps of 25% and not below 100%. */
+    dpi_long = dpi * max( current->dmPelsWidth, current->dmPelsHeight ) /
+               max( physical->dmPelsWidth, physical->dmPelsHeight );
+    dpi_short = dpi * min( current->dmPelsWidth, current->dmPelsHeight ) /
+                min( physical->dmPelsWidth, physical->dmPelsHeight );
+    if (min( dpi_long, dpi_short ) >= dpi) return dpi;
+    return min( dpi, max( USER_DEFAULT_SCREEN_DPI, min( dpi_long, dpi_short ) / 24 * 24 ));
+}
+
+/* display_lock must be held */
 static struct ratio monitor_get_dpi( struct monitor *monitor, MONITOR_DPI_TYPE type, struct ratio *dpi_x, struct ratio *dpi_y )
 {
     struct ratio scale_x = {1, 1}, scale_y = {1, 1};
     struct source *source = monitor->source;
     UINT dpi;
 
-    if (!source || !(dpi = source->dpi)) dpi = system_dpi;
+    if (!source) dpi = system_dpi;
+    else dpi = source_get_dpi( source );
     if (source && type != MDT_EFFECTIVE_DPI && (source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
     {
         scale_x.num = source->physical.dmPelsWidth;
