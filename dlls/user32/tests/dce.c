@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -34,6 +35,9 @@
 #endif
 
 static HWND hwnd_cache, hwnd_owndc, hwnd_classdc, hwnd_classdc2, hwnd_parent, hwnd_parentdc;
+
+static DPI_AWARENESS_CONTEXT (WINAPI *pSetThreadDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+static UINT (WINAPI *pGetDpiForSystem)(void);
 
 /* test behavior of DC attributes with various GetDC/ReleaseDC combinations */
 static void test_dc_attributes(void)
@@ -711,6 +715,517 @@ static void test_dc_layout(void)
     DestroyWindow(hwnd_cache_rtl);
 }
 
+struct text_results
+{
+    BOOL tm_ret;
+    BYTE tm[sizeof(TEXTMETRICA)];
+    SIZE extent[4];
+    int fit;
+    int dx[12];
+    BOOL width_ret;
+    int width['z' - 'A' + 1];
+    BOOL abc_ret;
+    ABC abc['z' - 'A' + 1];
+    int otm[17];
+    DWORD glyph_ret;
+    GLYPHMETRICS gm;
+    DWORD kern_pairs;
+};
+
+struct region_results
+{
+    int ret;
+    DWORD size;
+    DWORD data[(sizeof(RGNDATAHEADER) + 32 * sizeof(RECT)) / sizeof(DWORD)];
+};
+
+struct path_results
+{
+    int count;
+    POINT points[512];
+    BYTE types[512];
+    int rgn_ret;
+    RECT rgn_box;
+};
+
+struct dc_results
+{
+    BOOL update_ret;
+    RECT update_rect;
+    struct region_results update_rgn;
+    RECT paint_rect;
+    int caps[4];
+    POINT lp_to_dp[5][25];
+    POINT dp_to_lp[5][25];
+    int clip_ret[8];
+    RECT clip_box[8];
+    struct region_results clip_rgn[2];
+    struct region_results meta_rgn;
+    int sysrgn_ret;
+    RECT sysrgn_box;
+    POINT dc_org;
+    BOOL pt_visible[64];
+    BOOL rect_visible[64];
+    POINT line_pos;
+    POINT text_pos;
+    struct path_results path[2];
+    BOOL scroll_ret;
+    RECT scroll_rect;
+    int scroll_rgn_ret;
+    RECT scroll_rgn_box;
+    struct text_results text[5];
+};
+
+static const char *dc_names[3] = { "GetDC", "GetDCEx", "BeginPaint" };
+static const char *font_names[5] = { "System", "MS Shell Dlg -11", "Tahoma -13", "Tahoma 0", "Tahoma bold" };
+
+/* the Windows behaviour of these with GDI scaling above 96 DPI has not been verified */
+static BOOL test_unverified;
+
+static void flush_events(void)
+{
+    DWORD time = GetTickCount() + 100;
+    MSG msg;
+    int diff;
+
+    while ((diff = time - GetTickCount()) > 0)
+    {
+        if (MsgWaitForMultipleObjects( 0, NULL, FALSE, diff, QS_ALLINPUT ) == WAIT_TIMEOUT) break;
+        while (PeekMessageA( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageA( &msg );
+    }
+}
+
+static void check_results_( int line, const char *name, const void *res, const void *expect, size_t size )
+{
+    const int *ptr = res, *expect_ptr = expect;
+    unsigned int i, count = size / sizeof(int);
+
+    for (i = 0; i < count; i++) if (ptr[i] != expect_ptr[i]) break;
+    ok_(__FILE__, line)( i == count, "%s: got %d at index %u, expected %d\n", name,
+                         i < count ? ptr[i] : 0, i, i < count ? expect_ptr[i] : 0 );
+}
+#define check_results( res, expect, field ) \
+    check_results_( __LINE__, #field, &(res)->field, &(expect)->field, sizeof((res)->field) )
+
+static void measure_text( HDC hdc, HFONT font, struct text_results *res )
+{
+    static const char *strings[3] = { "Wine", "GDI scaling", "The quick brown fox jumps over the lazy dog" };
+    static const MAT2 mat = { {0, 1}, {0, 0}, {0, 0}, {0, 1} };
+    OUTLINETEXTMETRICA *otm;
+    TEXTMETRICA tm;
+    HFONT old_font;
+    UINT i, size;
+
+    old_font = SelectObject( hdc, font );
+
+    memset( &tm, 0, sizeof(tm) );
+    res->tm_ret = GetTextMetricsA( hdc, &tm );
+    /* skip the trailing padding */
+    memcpy( res->tm, &tm, FIELD_OFFSET( TEXTMETRICA, tmCharSet ) + sizeof(tm.tmCharSet) );
+    for (i = 0; i < ARRAY_SIZE(strings); i++)
+        GetTextExtentPoint32A( hdc, strings[i], strlen( strings[i] ), &res->extent[i] );
+    GetTextExtentExPointA( hdc, strings[1], strlen( strings[1] ), 50, &res->fit, res->dx, &res->extent[3] );
+    res->width_ret = GetCharWidth32A( hdc, 'A', 'z', res->width );
+    res->abc_ret = GetCharABCWidthsA( hdc, 'A', 'z', res->abc );
+
+    size = GetOutlineTextMetricsA( hdc, 0, NULL );
+    if (size && (otm = calloc( 1, size )))
+    {
+        res->otm[0] = GetOutlineTextMetricsA( hdc, size, otm );
+        res->otm[1] = otm->otmEMSquare;
+        res->otm[2] = otm->otmAscent;
+        res->otm[3] = otm->otmDescent;
+        res->otm[4] = otm->otmLineGap;
+        res->otm[5] = otm->otmsCapEmHeight;
+        res->otm[6] = otm->otmsXHeight;
+        res->otm[7] = otm->otmrcFontBox.left;
+        res->otm[8] = otm->otmrcFontBox.top;
+        res->otm[9] = otm->otmrcFontBox.right;
+        res->otm[10] = otm->otmrcFontBox.bottom;
+        res->otm[11] = otm->otmMacAscent;
+        res->otm[12] = otm->otmMacDescent;
+        res->otm[13] = otm->otmMacLineGap;
+        res->otm[14] = otm->otmusMinimumPPEM;
+        res->otm[15] = otm->otmsUnderscoreSize;
+        res->otm[16] = otm->otmsUnderscorePosition;
+        free( otm );
+    }
+
+    res->glyph_ret = GetGlyphOutlineA( hdc, 'g', GGO_METRICS, &res->gm, 0, NULL, &mat );
+    res->kern_pairs = GetKerningPairsA( hdc, 0, NULL );
+
+    SelectObject( hdc, old_font );
+}
+
+static void get_region_results( HRGN hrgn, int ret, struct region_results *res )
+{
+    res->ret = ret;
+    if (ret > 0) res->size = GetRegionData( hrgn, sizeof(res->data), (RGNDATA *)res->data );
+}
+
+static void measure_path( HDC hdc, const char *text, struct path_results *res )
+{
+    HRGN rgn;
+
+    BeginPath( hdc );
+    MoveToEx( hdc, 5, 7, NULL );
+    if (text) TextOutA( hdc, 9, 11, text, strlen( text ) );
+    LineTo( hdc, 170, 120 );
+    LineTo( hdc, 30, 130 );
+    CloseFigure( hdc );
+    EndPath( hdc );
+    res->count = GetPath( hdc, NULL, NULL, 0 );
+    if (res->count > 0 && res->count <= ARRAY_SIZE(res->points))
+        GetPath( hdc, res->points, res->types, res->count );
+    rgn = PathToRegion( hdc );
+    res->rgn_ret = GetRgnBox( rgn, &res->rgn_box );
+    DeleteObject( rgn );
+}
+
+static void measure_dc( HDC hdc, HWND hwnd, const HFONT *fonts, struct dc_results *res )
+{
+    static const int grid_x[5] = { -37, 0, 13, 101, 255 }, grid_y[5] = { -23, 0, 7, 77, 149 };
+    static const int vis_x[8] = { 0, 12, 13, 99, 150, 151, 199, 200 };
+    static const int vis_y[8] = { 0, 6, 7, 55, 96, 97, 149, 150 };
+    static const XFORM xform = { 1.5f, 0.0f, 0.0f, 1.5f, 0.0f, 0.0f };
+    RECT rect, scroll_rect = { 10, 10, 110, 90 }, scroll_clip = { 0, 0, 150, 120 };
+    POINT org;
+    HRGN rgn;
+    int i, j;
+
+    rgn = CreateRectRgn( 0, 0, 0, 0 );
+
+    res->caps[0] = GetDeviceCaps( hdc, LOGPIXELSX );
+    res->caps[1] = GetDeviceCaps( hdc, LOGPIXELSY );
+    res->caps[2] = GetDeviceCaps( hdc, HORZRES );
+    res->caps[3] = GetDeviceCaps( hdc, VERTRES );
+
+    /* MM_TEXT, MM_LOMETRIC, MM_ANISOTROPIC, world transform, RTL layout */
+    for (i = 0; i < ARRAY_SIZE(res->lp_to_dp); i++)
+    {
+        SaveDC( hdc );
+        switch (i)
+        {
+        case 1:
+            SetMapMode( hdc, MM_LOMETRIC );
+            break;
+        case 2:
+            SetMapMode( hdc, MM_ANISOTROPIC );
+            SetWindowExtEx( hdc, 3, 7, NULL );
+            SetViewportExtEx( hdc, 7, 3, NULL );
+            break;
+        case 3:
+            SetGraphicsMode( hdc, GM_ADVANCED );
+            SetWorldTransform( hdc, &xform );
+            break;
+        case 4:
+            SetLayout( hdc, LAYOUT_RTL );
+            break;
+        }
+        for (j = 0; j < 25; j++)
+        {
+            res->lp_to_dp[i][j].x = res->dp_to_lp[i][j].x = grid_x[j % 5];
+            res->lp_to_dp[i][j].y = res->dp_to_lp[i][j].y = grid_y[j / 5];
+        }
+        LPtoDP( hdc, res->lp_to_dp[i], 25 );
+        DPtoLP( hdc, res->dp_to_lp[i], 25 );
+        SetLayout( hdc, 0 );
+        RestoreDC( hdc, -1 );
+    }
+
+    SaveDC( hdc );
+    res->clip_ret[0] = GetClipBox( hdc, &res->clip_box[0] );
+    IntersectClipRect( hdc, 3, 5, 177, 131 );
+    res->clip_ret[1] = GetClipBox( hdc, &res->clip_box[1] );
+    ExcludeClipRect( hdc, 21, 19, 47, 33 );
+    res->clip_ret[2] = GetClipBox( hdc, &res->clip_box[2] );
+    SetRectRgn( rgn, 11, 13, 163, 121 );
+    ExtSelectClipRgn( hdc, rgn, RGN_AND );
+    res->clip_ret[3] = GetClipBox( hdc, &res->clip_box[3] );
+    SetRectRgn( rgn, 31, 41, 59, 67 );
+    ExtSelectClipRgn( hdc, rgn, RGN_DIFF );
+    res->clip_ret[4] = GetClipBox( hdc, &res->clip_box[4] );
+    get_region_results( rgn, GetClipRgn( hdc, rgn ), &res->clip_rgn[0] );
+    SaveDC( hdc );
+    IntersectClipRect( hdc, 1, 1, 99, 77 );
+    res->clip_ret[5] = GetClipBox( hdc, &res->clip_box[5] );
+    RestoreDC( hdc, -1 );
+    res->clip_ret[6] = GetClipBox( hdc, &res->clip_box[6] );
+    SetMetaRgn( hdc );
+    res->clip_ret[7] = GetClipBox( hdc, &res->clip_box[7] );
+    get_region_results( rgn, GetClipRgn( hdc, rgn ), &res->clip_rgn[1] );
+    get_region_results( rgn, GetMetaRgn( hdc, rgn ), &res->meta_rgn );
+    RestoreDC( hdc, -1 );
+
+    res->sysrgn_ret = GetRandomRgn( hdc, rgn, SYSRGN );
+    GetRgnBox( rgn, &res->sysrgn_box );
+
+    GetDCOrgEx( hdc, &org );
+    GetWindowRect( hwnd, &rect );
+    res->dc_org.x = org.x - rect.left;
+    res->dc_org.y = org.y - rect.top;
+
+    for (i = 0; i < ARRAY_SIZE(res->pt_visible); i++)
+    {
+        int x = vis_x[i % 8], y = vis_y[i / 8];
+
+        res->pt_visible[i] = PtVisible( hdc, x, y );
+        SetRect( &rect, x - 1, y - 1, x + 1, y + 1 );
+        res->rect_visible[i] = RectVisible( hdc, &rect );
+    }
+
+    SaveDC( hdc );
+    MoveToEx( hdc, 17, 23, NULL );
+    LineTo( hdc, 61, 45 );
+    GetCurrentPositionEx( hdc, &res->line_pos );
+    SetTextAlign( hdc, TA_UPDATECP );
+    TextOutA( hdc, 0, 0, "Wine", 4 );
+    GetCurrentPositionEx( hdc, &res->text_pos );
+    RestoreDC( hdc, -1 );
+
+    SaveDC( hdc );
+    SelectObject( hdc, fonts[2] );
+    measure_path( hdc, NULL, &res->path[0] );
+    measure_path( hdc, "Ab", &res->path[1] );
+    RestoreDC( hdc, -1 );
+
+    SetRectRgn( rgn, 0, 0, 0, 0 );
+    res->scroll_ret = ScrollDC( hdc, 7, -5, &scroll_rect, &scroll_clip, rgn, &res->scroll_rect );
+    res->scroll_rgn_ret = GetRgnBox( rgn, &res->scroll_rgn_box );
+
+    for (i = 0; i < ARRAY_SIZE(res->text); i++) measure_text( hdc, fonts[i], &res->text[i] );
+
+    DeleteObject( rgn );
+}
+
+static void check_dc_pixels( HDC hdc )
+{
+    static const COLORREF color = RGB( 0xff, 0x00, 0xff ), fill = RGB( 0x00, 0xff, 0x00 );
+    BITMAPINFO info = {{ sizeof(BITMAPINFOHEADER), 64, -48, 1, 32, BI_RGB }};
+    RECT rect = { 20, 10, 84, 58 };
+    HBITMAP bitmap;
+    COLORREF pixel;
+    HBRUSH brush;
+    DWORD *bits;
+    HDC mem_dc;
+    BITMAP bm;
+    int i;
+
+    bitmap = CreateCompatibleBitmap( hdc, 37, 23 );
+    ok( bitmap != 0, "CreateCompatibleBitmap failed\n" );
+    memset( &bm, 0, sizeof(bm) );
+    GetObjectA( bitmap, sizeof(bm), &bm );
+    ok( bm.bmWidth == 37 && bm.bmHeight == 23, "got bitmap size %dx%d\n", bm.bmWidth, bm.bmHeight );
+    DeleteObject( bitmap );
+
+    if (!test_unverified) return;
+
+    SetPixel( hdc, 30, 20, color );
+    pixel = GetPixel( hdc, 30, 20 );
+    ok( pixel == color, "got pixel %08lx\n", pixel );
+
+    brush = CreateSolidBrush( fill );
+    FillRect( hdc, &rect, brush );
+    DeleteObject( brush );
+
+    mem_dc = CreateCompatibleDC( hdc );
+    bitmap = CreateDIBSection( mem_dc, &info, DIB_RGB_COLORS, (void **)&bits, NULL, 0 );
+    ok( bitmap != 0, "CreateDIBSection failed\n" );
+    SelectObject( mem_dc, bitmap );
+    BitBlt( mem_dc, 0, 0, 64, 48, hdc, rect.left, rect.top, SRCCOPY );
+    GdiFlush();
+    for (i = 0; i < 64 * 48; i++) if (bits[i] != 0x00ff00) break;
+    ok( i == 64 * 48, "got %08lx at %d,%d\n", i < 64 * 48 ? bits[i] : 0, i % 64, i / 64 );
+    DeleteDC( mem_dc );
+    DeleteObject( bitmap );
+}
+
+static void measure_window( DPI_AWARENESS_CONTEXT context, const HFONT *fonts, struct dc_results *res )
+{
+    static const DWORD style = WS_POPUP | WS_BORDER | WS_VISIBLE, ex_style = WS_EX_TOPMOST;
+    RECT rect = { 13, 7, 151, 97 }, window_rect = { 50, 50, 250, 200 };
+    PAINTSTRUCT ps;
+    HWND hwnd;
+    HRGN rgn;
+    HDC hdc;
+    int i;
+
+    pSetThreadDpiAwarenessContext( context );
+    /* use a frame so that window DCs have a different origin than client DCs */
+    AdjustWindowRectEx( &window_rect, style, FALSE, ex_style );
+    hwnd = CreateWindowExA( ex_style, "cache_class", NULL, style, window_rect.left, window_rect.top,
+                            window_rect.right - window_rect.left, window_rect.bottom - window_rect.top,
+                            0, 0, GetModuleHandleA(0), NULL );
+    ok( hwnd != 0, "failed to create window\n" );
+    UpdateWindow( hwnd );
+    flush_events();
+
+    rgn = CreateRectRgn( 0, 0, 0, 0 );
+    for (i = 0; i < ARRAY_SIZE(dc_names); i++)
+    {
+        winetest_push_context( "%s", dc_names[i] );
+        if (i == 0) hdc = GetDC( hwnd );
+        else if (i == 1) hdc = GetDCEx( hwnd, 0, DCX_WINDOW | DCX_CACHE );
+        else
+        {
+            RedrawWindow( hwnd, NULL, 0, RDW_VALIDATE | RDW_NOFRAME | RDW_NOERASE );
+            InvalidateRect( hwnd, &rect, FALSE );
+            res[i].update_ret = GetUpdateRect( hwnd, &res[i].update_rect, FALSE );
+            get_region_results( rgn, GetUpdateRgn( hwnd, rgn, FALSE ), &res[i].update_rgn );
+            hdc = BeginPaint( hwnd, &ps );
+            res[i].paint_rect = ps.rcPaint;
+        }
+        ok( hdc != 0, "failed to get DC\n" );
+
+        measure_dc( hdc, hwnd, fonts, &res[i] );
+        check_dc_pixels( hdc );
+
+        if (i == 2) EndPaint( hwnd, &ps );
+        else ReleaseDC( hwnd, hdc );
+        winetest_pop_context();
+    }
+    DeleteObject( rgn );
+
+    DestroyWindow( hwnd );
+}
+
+static void compare_text_results( const struct text_results *res, const struct text_results *expect )
+{
+    check_results( res, expect, tm_ret );
+    check_results( res, expect, tm );
+    check_results( res, expect, extent );
+    check_results( res, expect, fit );
+    check_results( res, expect, dx );
+    check_results( res, expect, width_ret );
+    check_results( res, expect, width );
+    check_results( res, expect, abc_ret );
+    check_results( res, expect, abc );
+    check_results( res, expect, otm );
+    check_results( res, expect, glyph_ret );
+    check_results( res, expect, gm );
+    check_results( res, expect, kern_pairs );
+}
+
+static void compare_dc_results( const struct dc_results *res, const struct dc_results *expect )
+{
+    check_results( res, expect, update_ret );
+    check_results( res, expect, update_rect );
+    check_results( res, expect, update_rgn );
+    check_results( res, expect, paint_rect );
+    check_results( res, expect, caps );
+    check_results( res, expect, lp_to_dp );
+    check_results( res, expect, dp_to_lp );
+    check_results( res, expect, clip_ret );
+    check_results( res, expect, clip_box );
+    check_results( res, expect, clip_rgn );
+    check_results( res, expect, meta_rgn );
+    check_results( res, expect, dc_org );
+    check_results( res, expect, pt_visible );
+    check_results( res, expect, rect_visible );
+    check_results( res, expect, line_pos );
+    check_results( res, expect, path[0].count );
+    check_results( res, expect, path[0].points );
+    check_results( res, expect, path[0].types );
+    check_results( res, expect, path[0].rgn_ret );
+    check_results( res, expect, path[0].rgn_box );
+    check_results( res, expect, scroll_ret );
+    check_results( res, expect, scroll_rect );
+    check_results( res, expect, scroll_rgn_ret );
+    check_results( res, expect, scroll_rgn_box );
+    if (test_unverified)
+    {
+        check_results( res, expect, sysrgn_ret );
+        check_results( res, expect, sysrgn_box );
+        /* these depend on text metrics and glyph outlines */
+        check_results( res, expect, text_pos );
+        check_results( res, expect, path[1].count );
+        check_results( res, expect, path[1].points );
+        check_results( res, expect, path[1].types );
+        check_results( res, expect, path[1].rgn_ret );
+        check_results( res, expect, path[1].rgn_box );
+    }
+}
+
+/* GDI scaling must not change anything an application can observe through GDI */
+static void test_gdi_scaled_dc(void)
+{
+    struct dc_results *unaware, *scaled;
+    struct text_results *compat;
+    DPI_AWARENESS_CONTEXT orig;
+    HFONT fonts[5];
+    LOGFONTA lf;
+    UINT system_dpi;
+    HDC hdc;
+    int i, j;
+
+    if (!pSetThreadDpiAwarenessContext ||
+        !(orig = pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED )))
+    {
+        win_skip( "DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED not supported\n" );
+        return;
+    }
+
+    /* GetDpiForSystem() always returns 96 in DPI unaware threads */
+    pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_SYSTEM_AWARE );
+    system_dpi = pGetDpiForSystem();
+    test_unverified = winetest_platform_is_wine || system_dpi == USER_DEFAULT_SCREEN_DPI;
+    if (!test_unverified) skip( "system DPI %u, skipping some tests\n", system_dpi );
+
+    fonts[0] = GetStockObject( SYSTEM_FONT );
+    memset( &lf, 0, sizeof(lf) );
+    lf.lfHeight = -11;
+    lf.lfWeight = FW_NORMAL;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    strcpy( lf.lfFaceName, "MS Shell Dlg" );
+    fonts[1] = CreateFontIndirectA( &lf );
+    lf.lfHeight = -13;
+    strcpy( lf.lfFaceName, "Tahoma" );
+    fonts[2] = CreateFontIndirectA( &lf );
+    lf.lfHeight = 0;
+    fonts[3] = CreateFontIndirectA( &lf );
+    lf.lfHeight = -13;
+    lf.lfWeight = FW_BOLD;
+    fonts[4] = CreateFontIndirectA( &lf );
+
+    unaware = calloc( ARRAY_SIZE(dc_names), sizeof(*unaware) );
+    scaled = calloc( ARRAY_SIZE(dc_names), sizeof(*scaled) );
+    compat = calloc( ARRAY_SIZE(fonts), sizeof(*compat) );
+
+    winetest_push_context( "unaware" );
+    measure_window( DPI_AWARENESS_CONTEXT_UNAWARE, fonts, unaware );
+    winetest_pop_context();
+    winetest_push_context( "gdiscaled" );
+    measure_window( DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED, fonts, scaled );
+    winetest_pop_context();
+
+    pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE );
+    hdc = CreateCompatibleDC( 0 );
+    for (i = 0; i < ARRAY_SIZE(fonts); i++) measure_text( hdc, fonts[i], &compat[i] );
+    DeleteDC( hdc );
+
+    for (i = 0; i < ARRAY_SIZE(dc_names); i++)
+    {
+        winetest_push_context( "%s", dc_names[i] );
+        compare_dc_results( &scaled[i], &unaware[i] );
+        for (j = 0; test_unverified && j < ARRAY_SIZE(fonts); j++)
+        {
+            winetest_push_context( "%s unaware", font_names[j] );
+            compare_text_results( &scaled[i].text[j], &unaware[i].text[j] );
+            winetest_pop_context();
+            winetest_push_context( "%s memory DC", font_names[j] );
+            compare_text_results( &scaled[i].text[j], &compat[j] );
+            winetest_pop_context();
+        }
+        winetest_pop_context();
+    }
+
+    free( compat );
+    free( scaled );
+    free( unaware );
+    for (i = 1; i < ARRAY_SIZE(fonts); i++) DeleteObject( fonts[i] );
+    pSetThreadDpiAwarenessContext( orig );
+}
+
 static void test_destroyed_window(void)
 {
     HDC dc, old_dc;
@@ -785,7 +1300,11 @@ static void test_destroyed_window(void)
 
 START_TEST(dce)
 {
+    HMODULE user32 = GetModuleHandleA( "user32.dll" );
     WNDCLASSA cls;
+
+    pSetThreadDpiAwarenessContext = (void *)GetProcAddress( user32, "SetThreadDpiAwarenessContext" );
+    pGetDpiForSystem = (void *)GetProcAddress( user32, "GetDpiForSystem" );
 
     cls.style = CS_DBLCLKS;
     cls.lpfnWndProc = DefWindowProcA;
@@ -833,6 +1352,7 @@ START_TEST(dce)
     test_scroll_window();
     test_invisible_create();
     test_dc_layout();
+    test_gdi_scaled_dc();
     /* this should be last */
     test_destroyed_window();
 }

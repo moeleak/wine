@@ -3496,6 +3496,7 @@ static void test_settings(void)
     static const WCHAR trueW[] = {'t','r','u','e',0};
     static const WCHAR namespace2005W[] = {'h','t','t','p',':','/','/','s','c','h','e','m','a','s','.','m','i','c','r','o','s','o','f','t','.','c','o','m','/','S','M','I','/','2','0','0','5','/','W','i','n','d','o','w','s','S','e','t','t','i','n','g','s',0};
     static const WCHAR namespace2016W[] = {'h','t','t','p',':','/','/','s','c','h','e','m','a','s','.','m','i','c','r','o','s','o','f','t','.','c','o','m','/','S','M','I','/','2','0','1','6','/','W','i','n','d','o','w','s','S','e','t','t','i','n','g','s',0};
+    static const WCHAR namespace2017W[] = L"http://schemas.microsoft.com/SMI/2017/WindowsSettings";
     WCHAR buffer[80];
     SIZE_T size;
     HANDLE handle;
@@ -3612,6 +3613,24 @@ static void test_settings(void)
         ok( ret, "QueryActCtxSettingsW failed err %lu\n", GetLastError() );
         ok( !lstrcmpW( buffer, trueW ), "got %s\n", wine_dbgstr_w(buffer) );
         ok( size == lstrlenW( buffer ) + 1, "wrong len %Iu\n", size );
+        SetLastError( 0xdeadbeef );
+        size = 0xdead;
+        memset( buffer, 0xcc, sizeof(buffer) );
+        ret = pQueryActCtxSettingsW( 0, handle, namespace2017W, L"gdiScaling", buffer, 80, &size );
+        ok( ret || broken( GetLastError() == ERROR_INVALID_PARAMETER ), /* < win10 1703 */
+            "QueryActCtxSettingsW failed err %lu\n", GetLastError() );
+        if (ret)
+        {
+            ok( !lstrcmpW( buffer, trueW ), "got %s\n", wine_dbgstr_w(buffer) );
+            ok( size == ARRAY_SIZE(trueW), "wrong len %Iu\n", size );
+        }
+        SetLastError( 0xdeadbeef );
+        size = 0xdead;
+        memset( buffer, 0xcc, sizeof(buffer) );
+        ret = pQueryActCtxSettingsW( 0, handle, namespace2005W, L"gdiScaling", buffer, 80, &size );
+        ok( !ret, "QueryActCtxSettingsW succeeded\n" );
+        ok( GetLastError() == ERROR_SXS_KEY_NOT_FOUND, "wrong error %lu\n", GetLastError() );
+        ok( buffer[0] == 0xcccc, "got %s\n", wine_dbgstr_w(buffer) );
         ReleaseActCtx(handle);
     }
 

@@ -2104,11 +2104,13 @@ static NTSTATUS get_window_region( HWND hwnd, BOOL surface, HRGN *region, RECT *
 static void update_surface_region( HWND hwnd )
 {
     WND *win = get_win_ptr( hwnd );
-    HRGN region, shape = 0;
+    HRGN region, shape = 0, surface_shape = 0;
     RECT visible;
+    UINT scale;
 
     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
     if (!win->surface) goto done;
+    scale = get_window_surface_scale( win->surface );
 
     if (get_window_region( hwnd, FALSE, &shape, &visible )) goto done;
     if (shape)
@@ -2118,19 +2120,29 @@ static void update_surface_region( HWND hwnd )
         if (win->dwExStyle & WS_EX_LAYOUTRTL) NtUserMirrorRgn( hwnd, shape );
         NtGdiDeleteObjectApp( region );
     }
-    window_surface_set_shape( win->surface, shape );
+
+    /* the regions are in window coordinates, scale them to the surface pixels */
+    if (shape && scale > 1)
+    {
+        surface_shape = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+        scale_region( surface_shape, shape, scale );
+    }
+    else surface_shape = shape;
+    window_surface_set_shape( win->surface, surface_shape );
 
     if (get_window_region( hwnd, TRUE, &region, &visible )) goto done;
-    if (!region) window_surface_set_clip( win->surface, shape );
+    if (!region) window_surface_set_clip( win->surface, surface_shape );
     else
     {
         NtGdiOffsetRgn( region, -visible.left, -visible.top );
         if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
+        if (scale > 1) scale_region( region, region, scale );
         window_surface_set_clip( win->surface, region );
         NtGdiDeleteObjectApp( region );
     }
 
 done:
+    if (surface_shape && surface_shape != shape) NtGdiDeleteObjectApp( surface_shape );
     if (shape) NtGdiDeleteObjectApp( shape );
     release_win_ptr( win );
 }
@@ -2187,16 +2199,34 @@ static BOOL get_surface_rect( const RECT *visible_rect, RECT *surface_rect )
     return TRUE;
 }
 
-static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, struct window_surface **surface )
+/* pixel scale of the window surface of a toplevel window, its window DCs are rasterized at that scale */
+static UINT get_window_gdi_scale( HWND hwnd, struct ratio eff_dpi, UINT ex_style, BOOL create_layered )
+{
+    UINT context, dpi;
+
+    /* layered window surfaces are never scaled */
+    if (create_layered || (ex_style & WS_EX_LAYERED)) return 1;
+    context = get_window_dpi_awareness_context( hwnd );
+    if (!(NTUSER_DPI_CONTEXT_GET_FLAGS( context ) & NTUSER_DPI_CONTEXT_FLAG_GDISCALED)) return 1;
+    if (gdi_scale_override) return gdi_scale_override;
+
+    /* round the monitor scale up to an integer, ignoring up to 1/8, the surface flush scales the rest */
+    if ((dpi = round_dpi( eff_dpi )) <= 108) return 1;
+    return min( 4, (dpi - 12 + 95) / 96 );
+}
+
+static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, UINT scale,
+                                        struct window_surface **surface )
 {
     struct window_surface *previous;
     WND *win;
 
-    TRACE( "hwnd %p, surface_rect %s, surface %p\n", hwnd, wine_dbgstr_rect( surface_rect ), surface );
+    TRACE( "hwnd %p, surface_rect %s, scale %u, surface %p\n", hwnd, wine_dbgstr_rect( surface_rect ),
+           scale, surface );
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
 
-    if ((previous = win->surface) && EqualRect( &previous->rect, surface_rect ))
+    if ((previous = win->surface) && can_reuse_window_surface( previous, surface_rect, scale ))
     {
         window_surface_add_ref( (*surface = previous) );
         TRACE( "trying to reuse previous surface %p\n", previous );
@@ -2223,8 +2253,8 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
     struct window_surface *new_surface;
     struct window_rects monitor_rects;
-    struct ratio raw_dpi;
-    UINT style, ex_style;
+    struct ratio raw_dpi, eff_dpi;
+    UINT style, ex_style, scale = 1;
     RECT dummy;
     HRGN shape;
 
@@ -2232,8 +2262,13 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
     is_child = parent && parent != NtUserGetDesktopWindow();
 
+    /* child windows don't have their own surface, they use the scale of their toplevel surface */
     if (is_child) get_win_monitor_dpi( parent, &raw_dpi );
-    else monitor_dpi_from_rect( rects->window, get_thread_dpi(), &raw_dpi );
+    else
+    {
+        eff_dpi = monitor_dpi_from_rect( rects->window, get_thread_dpi(), &raw_dpi );
+        scale = get_window_gdi_scale( hwnd, eff_dpi, ex_style, create_layered );
+    }
 
     if (get_window_region( hwnd, FALSE, &shape, &dummy )) shaped = FALSE;
     else if ((shaped = !!shape)) NtGdiDeleteObjectApp( shape );
@@ -2250,7 +2285,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
 
     if (!is_child) rects->visible = get_visible_rect( hwnd, shaped, style, ex_style, rects );
     if (!get_surface_rect( &rects->visible, surface_rect )) needs_surface = FALSE;
-    if (!get_default_window_surface( hwnd, surface_rect, &new_surface )) return NULL;
+    if (!get_default_window_surface( hwnd, surface_rect, scale, &new_surface )) return NULL;
 
     is_layered = new_surface && new_surface->alpha_mask;
     create_opaque = !(get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED);
@@ -2266,7 +2301,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else if (create_layered || is_layered) needs_surface = TRUE;
 
     if (needs_surface)
-        create_window_surface( hwnd, create_layered, surface_rect, raw_dpi, &new_surface );
+        create_window_surface( hwnd, create_layered, surface_rect, scale, raw_dpi, &new_surface );
     else if (new_surface && new_surface != &dummy_surface)
     {
         window_surface_release( new_surface );
@@ -2312,6 +2347,23 @@ static BOOL is_fullscreen( const MONITORINFO *info, const RECT *rect )
            rect->top <= info->rcMonitor.top && rect->bottom >= info->rcMonitor.bottom;
 }
 
+/* rect of a window surface in window coordinates, the surface rect is in surface pixels */
+static RECT get_surface_window_rect( struct window_surface *surface )
+{
+    UINT scale = get_window_surface_scale( surface );
+    RECT rect = surface->rect;
+
+    /* scaled surface rects are exact multiples of the scale */
+    if (scale > 1)
+    {
+        rect.left   /= (int)scale;
+        rect.top    /= (int)scale;
+        rect.right  /= (int)scale;
+        rect.bottom /= (int)scale;
+    }
+    return rect;
+}
+
 /***********************************************************************
  *           apply_window_pos
  *
@@ -2324,7 +2376,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     WND *win;
     HWND owner_hint, surface_win = 0, toplevel;
     struct ratio raw_dpi, dpi = get_thread_dpi();
-    BOOL ret, is_layered, is_child, need_icons = FALSE;
+    BOOL ret, is_layered, is_child, need_icons = FALSE, rescaled = FALSE;
     struct window_rects old_rects;
     RECT extra_rects[3];
     struct window_surface *old_surface;
@@ -2352,6 +2404,15 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         valid_rects = NULL;
     }
 
+    /* don't copy the old surface pixels if the surface scale changes, repaint the window instead */
+    if (old_surface && new_surface && old_surface != &dummy_surface && new_surface != &dummy_surface &&
+        get_window_surface_scale( old_surface ) != get_window_surface_scale( new_surface ))
+    {
+        swp_flags |= SWP_NOCOPYBITS;
+        valid_rects = NULL;
+        rescaled = TRUE;
+    }
+
     SERVER_START_REQ( set_window_pos )
     {
         req->handle        = wine_server_user_handle( hwnd );
@@ -2364,7 +2425,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             extra_rects[0] = extra_rects[1] = new_rects->visible;
             if (new_surface)
             {
-                extra_rects[1] = is_layered ? dummy_surface.rect : new_surface->rect;
+                extra_rects[1] = is_layered ? dummy_surface.rect : get_surface_window_rect( new_surface );
                 OffsetRect( &extra_rects[1], new_rects->visible.left, new_rects->visible.top );
             }
             if (valid_rects) extra_rects[2] = valid_rects[0];
@@ -2499,6 +2560,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
                                         get_driver_window_surface( new_surface, raw_dpi ) );
         update_client_surfaces( toplevel );
+
+        /* the new surface pixels are blank, the window has to be painted again at the new scale */
+        if (rescaled) NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
     }
 
     return ret;
@@ -2509,6 +2573,7 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
     struct window_surface *surface;
     struct window_rects rects;
     RECT exposed_rect;
+    UINT scale;
     WND *win;
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
@@ -2516,11 +2581,15 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
     rects = win->rects;
     release_win_ptr( win );
 
+    /* without a surface the rect is mapped to the window DPI, otherwise to the surface pixels */
+    scale = get_window_surface_scale( surface );
+
     if (rect)
     {
-        struct ratio raw_dpi;
+        struct ratio raw_dpi, dpi = get_dpi_for_window( hwnd );
         get_win_monitor_dpi( hwnd, &raw_dpi );
-        exposed_rect = map_dpi_rect( *rect, raw_dpi, get_dpi_for_window( hwnd ) );
+        dpi.num *= scale;
+        exposed_rect = map_dpi_rect( *rect, raw_dpi, dpi );
     }
 
     if (!surface || surface == &dummy_surface)
@@ -2534,7 +2603,8 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
     if (!rect) add_bounds_rect( &surface->bounds, &surface->rect );
     else
     {
-        OffsetRect( &exposed_rect, rects.client.left - rects.visible.left, rects.client.top - rects.visible.top );
+        OffsetRect( &exposed_rect, (int)scale * (rects.client.left - rects.visible.left),
+                    (int)scale * (rects.client.top - rects.visible.top) );
         intersect_rect( &exposed_rect, &exposed_rect, &surface->rect );
         add_bounds_rect( &surface->bounds, &exposed_rect );
     }

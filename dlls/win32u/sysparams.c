@@ -41,6 +41,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(system);
 #define WINE_ENUM_PHYSICAL_SETTINGS  ((DWORD) -3)
 
 static LONG dpi_context; /* process DPI awareness context */
+static LONG default_dpi_context; /* process DPI awareness context used until one is set */
 
 static HKEY video_key, enum_key, control_key, config_key, volatile_base_key;
 
@@ -167,6 +168,7 @@ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
 
 BOOL emulate_modeset = FALSE;
 BOOL decorated_mode = TRUE;
+UINT gdi_scale_override = 0;
 UINT64 thunk_lock_callback = 0;
 
 #define VIRTUAL_HMONITOR ((HMONITOR)(UINT_PTR)(0x10000 + 1))
@@ -3254,6 +3256,7 @@ UINT get_thread_dpi_awareness_context(void)
 
     if (!info->client_info || !(context = info->client_info->dpi_context))
         context = ReadNoFence( &dpi_context );
+    if (!context) context = ReadNoFence( &default_dpi_context );
     return context ? context : NTUSER_DPI_UNAWARE;
 }
 
@@ -6083,12 +6086,17 @@ void sysparams_init(void)
         decorated_mode = IS_OPTION_TRUE( buffer[0] );
     if (!get_config_key( hkey, appkey, "EmulateModeset", buffer, sizeof(buffer) ))
         emulate_modeset = IS_OPTION_TRUE( buffer[0] );
+    /* GDI scale of GDI scaled windows: 0 for automatic, 1 to disable GDI scaling, 2 to 4 to force it */
+    if (!get_config_key( hkey, appkey, "GdiScaleFactor", buffer, sizeof(buffer) ) &&
+        buffer[0] >= '0' && buffer[0] <= '4')
+        gdi_scale_override = buffer[0] - '0';
 
 #undef IS_OPTION_TRUE
 
     if (app_compat_flags)
     {
         if (strstr( app_compat_flags, "HIGHDPIAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_SYSTEM_AWARE, 0 );
+        if (strstr( app_compat_flags, "GDIDPISCALING" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_PER_UNAWARE_GDISCALED, 0 );
         if (strstr( app_compat_flags, "DPIUNAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_UNAWARE, 0 );
     }
     free( app_compat_flags );
@@ -7502,8 +7510,24 @@ ULONG WINAPI NtUserGetProcessDpiAwarenessContext( HANDLE process )
     }
 
     context = ReadNoFence( &dpi_context );
+    if (!context) context = ReadNoFence( &default_dpi_context );
     if (!context) return NTUSER_DPI_UNAWARE;
     return context;
+}
+
+/* set the context used while the process DPI awareness has not been set yet;
+ * unlike NtUserSetProcessDpiAwarenessContext, this doesn't lock the process context */
+static BOOL set_default_process_dpi_awareness_context( UINT context )
+{
+    if (context != NTUSER_DPI_UNAWARE && context != NTUSER_DPI_PER_UNAWARE_GDISCALED)
+    {
+        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    InterlockedExchange( &default_dpi_context, context );
+    TRACE( "default set to %#x\n", context );
+    return TRUE;
 }
 
 /***********************************************************************
@@ -7684,6 +7708,9 @@ ULONG_PTR WINAPI NtUserCallOneParam( ULONG_PTR arg, ULONG code )
 
     case NtUserCallOneParam_GetAsyncKeyboardState:
         return get_async_keyboard_state( (void *)arg );
+
+    case NtUserCallOneParam_SetDefaultProcessDpiAwarenessContext:
+        return set_default_process_dpi_awareness_context( arg );
 
     /* temporary exports */
     case NtUserGetDeskPattern:

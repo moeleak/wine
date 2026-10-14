@@ -148,6 +148,8 @@ struct scaled_surface
     struct window_surface *target_surface;
     struct ratio dpi_from;
     struct ratio dpi_to;
+    UINT scale;            /* pixel scale of the surface bitmap */
+    UINT requested_scale;  /* scale the surface was created for, larger if the scaled bitmap couldn't be allocated */
 };
 
 static struct scaled_surface *get_scaled_surface( struct window_surface *window_surface )
@@ -233,31 +235,55 @@ static void scaled_surface_set_target( struct scaled_surface *surface, struct wi
     surface->dpi_to = dpi_to;
 }
 
-static struct window_surface *scaled_surface_create( HWND hwnd, const RECT *surface_rect, struct ratio dpi_from, struct ratio dpi_to,
-                                                     struct window_surface *target_surface )
+static struct window_surface *scaled_surface_create( HWND hwnd, const RECT *surface_rect, UINT scale, struct ratio dpi_from,
+                                                     struct ratio dpi_to, struct window_surface *target_surface )
 {
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *info = (BITMAPINFO *)buffer;
+    RECT header_rect = scale_rect( *surface_rect, scale );
     struct window_surface *window_surface;
     struct scaled_surface *surface;
 
     memset( info, 0, sizeof(*info) );
     info->bmiHeader.biSize        = sizeof(info->bmiHeader);
-    info->bmiHeader.biWidth       = surface_rect->right;
-    info->bmiHeader.biHeight      = -surface_rect->bottom; /* top-down */
+    info->bmiHeader.biWidth       = header_rect.right;
+    info->bmiHeader.biHeight      = -header_rect.bottom; /* top-down */
     info->bmiHeader.biPlanes      = 1;
     info->bmiHeader.biBitCount    = 32;
     info->bmiHeader.biSizeImage   = get_dib_image_size( info );
     info->bmiHeader.biCompression = BI_RGB;
 
-    if ((window_surface = window_surface_create( &scaled_surface_funcs, hwnd, surface_rect, info, 0 )))
+    if ((window_surface = window_surface_create( &scaled_surface_funcs, hwnd, &header_rect, info, 0 )))
     {
         surface = get_scaled_surface( window_surface );
-        surface->dpi_from = dpi_from;
+        /* the surface bitmap has scale x scale pixels for each window pixel */
+        surface->dpi_from.num = dpi_from.num * scale;
+        surface->dpi_from.den = dpi_from.den;
+        surface->scale = surface->requested_scale = scale;
         scaled_surface_set_target( surface, target_surface, dpi_to );
     }
 
     return window_surface;
+}
+
+/* integer pixel scale of a window surface bitmap relative to the window rects */
+UINT get_window_surface_scale( struct window_surface *surface )
+{
+    if (!surface || surface->funcs != &scaled_surface_funcs) return 1;
+    return get_scaled_surface( surface )->scale;
+}
+
+/* check if a window surface was created for the given surface rect and scale */
+BOOL can_reuse_window_surface( struct window_surface *surface, const RECT *surface_rect, UINT scale )
+{
+    RECT rect = scale_rect( *surface_rect, get_window_surface_scale( surface ) );
+    UINT requested_scale = 1;
+
+    if (surface->funcs == &scaled_surface_funcs) requested_scale = get_scaled_surface( surface )->requested_scale;
+    /* offscreen surfaces are used when the driver has no window surfaces, they are never scaled */
+    else if (surface->funcs == &offscreen_window_surface_funcs) requested_scale = scale;
+
+    return requested_scale == scale && EqualRect( &surface->rect, &rect );
 }
 
 static RECT get_surface_rect( RECT rect )
@@ -272,8 +298,8 @@ static RECT get_surface_rect( RECT rect )
     return rect;
 }
 
-void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, struct ratio monitor_dpi,
-                            struct window_surface **window_surface )
+void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, UINT scale,
+                            struct ratio monitor_dpi, struct window_surface **window_surface )
 {
     struct window_surface *previous, *driver_surface;
     struct ratio dpi = get_dpi_for_window( hwnd );
@@ -299,15 +325,16 @@ void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_
         return;
     }
 
-    if (!driver_surface || !memcmp( &dpi, &monitor_dpi, sizeof(monitor_dpi) ))
+    if (!driver_surface || (scale == 1 && !memcmp( &dpi, &monitor_dpi, sizeof(monitor_dpi) )))
     {
         if (*window_surface) window_surface_release( *window_surface );
         *window_surface = driver_surface;
         return;
     }
 
-    /* reuse previous scaling surface, update its target to the driver surface */
-    if ((previous = *window_surface) && previous->funcs == &scaled_surface_funcs)
+    /* reuse previous scaling surface if it was created for the same scale, update its target to the driver surface */
+    if ((previous = *window_surface) && previous->funcs == &scaled_surface_funcs &&
+        can_reuse_window_surface( previous, surface_rect, scale ))
     {
         struct scaled_surface *surface = get_scaled_surface( previous );
         scaled_surface_set_target( surface, driver_surface, monitor_dpi );
@@ -316,7 +343,15 @@ void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_
     }
     if (previous) window_surface_release( previous );
 
-    *window_surface = scaled_surface_create( hwnd, surface_rect, dpi, monitor_dpi, driver_surface );
+    if (!(*window_surface = scaled_surface_create( hwnd, surface_rect, scale, dpi, monitor_dpi, driver_surface )) &&
+        scale > 1)
+    {
+        /* fall back to an unscaled surface if the scaled bitmap couldn't be allocated, and keep
+         * it for this scale instead of trying again on every window position change */
+        WARN( "failed to create a surface with scale %u for hwnd %p\n", scale, hwnd );
+        if ((*window_surface = scaled_surface_create( hwnd, surface_rect, 1, dpi, monitor_dpi, driver_surface )))
+            get_scaled_surface( *window_surface )->requested_scale = scale;
+    }
     window_surface_release( driver_surface );
 }
 
@@ -1684,6 +1719,7 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
     HRGN rgn = get_update_region( hwnd, &flags, NULL );
     HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
+    UINT scale = get_window_surface_scale( old_surface );
     void *bits;
 
     RECT dst = valid_rects[0];
@@ -1694,11 +1730,32 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     OffsetRect( &dst, -window_rect->left, -window_rect->top );
 
     window_surface_lock( old_surface );
-    bits = window_surface_get_color( old_surface, info );
-    NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
-                                    src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
-                                    0, old_surface->rect.bottom - old_surface->rect.top,
-                                    bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
+    if (scale != 1)
+    {
+        /* the old surface bitmap is scaled, copy its pixels 1:1 to the window DC raster pixels */
+        int width = dst.right - dst.left, height = dst.bottom - dst.top;
+        HDC hdc_src = NtGdiCreateCompatibleDC( 0 );
+        DWORD layout = NtGdiSetLayout( hdc, -1, 0 );
+
+        /* like SetDIBitsToDevice, mirror the destination rect of RTL windows but not the bits */
+        if (layout & LAYOUT_RTL) dst.left = window_rect->right - window_rect->left - dst.right;
+
+        NtGdiSelectBitmap( hdc_src, old_surface->color_bitmap );
+        set_stretch_blt_mode( hdc, COLORONCOLOR );
+        NtGdiStretchBlt( hdc, dst.left, dst.top, width, height, hdc_src,
+                         scale * src.left - old_surface->rect.left, scale * src.top - old_surface->rect.top,
+                         scale * width, scale * height, SRCCOPY, 0 );
+        NtGdiSetLayout( hdc, -1, layout );
+        NtGdiDeleteObjectApp( hdc_src );
+    }
+    else
+    {
+        bits = window_surface_get_color( old_surface, info );
+        NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                                        src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
+                                        0, old_surface->rect.bottom - old_surface->rect.top,
+                                        bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
+    }
     window_surface_unlock( old_surface );
     NtUserReleaseDC( hwnd, hdc );
 }

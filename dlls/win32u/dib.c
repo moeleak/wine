@@ -473,7 +473,16 @@ fail:
     return FALSE;
 }
 
-
+/* Map a clip region from source coordinates to the raster coordinates of a destination
+ * where each source pixel covers one device pixel; dst is in device coordinates. */
+static BOOL scale_dib_clip( HRGN clip, const struct bitblt_coords *src,
+                            const struct bitblt_coords *dst, UINT scale )
+{
+    NtGdiOffsetRgn( clip, -src->x, -src->y );
+    if (scale_region( clip, clip, scale ) == ERROR) return FALSE;
+    NtGdiOffsetRgn( clip, scale_device_coord( dst->x, scale ), scale_device_coord( dst->y, scale ));
+    return TRUE;
+}
 
 INT nulldrv_StretchDIBits( PHYSDEV dev, INT xDst, INT yDst, INT widthDst, INT heightDst,
                            INT xSrc, INT ySrc, INT widthSrc, INT heightSrc, const void *bits,
@@ -482,7 +491,7 @@ INT nulldrv_StretchDIBits( PHYSDEV dev, INT xDst, INT yDst, INT widthDst, INT he
     DC *dc = get_nulldrv_dc( dev );
     char dst_buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *dst_info = (BITMAPINFO *)dst_buffer;
-    struct bitblt_coords src, dst;
+    struct bitblt_coords src, dst, device_dst;
     struct gdi_image_bits src_bits;
     DWORD err;
     HRGN clip = NULL;
@@ -574,13 +583,24 @@ INT nulldrv_StretchDIBits( PHYSDEV dev, INT xDst, INT yDst, INT widthDst, INT he
     if (rop == SRCCOPY) ret = height;
     else ret = src_info->bmiHeader.biHeight;
 
+    /* all the device coordinate adjustments are done, map them to raster coordinates */
+    device_dst = dst;
+    scale_bitblt_coords( &dst, dc->gdi_scale );
     get_bounding_rect( &rect, dst.x, dst.y, dst.width, dst.height );
 
     if (!clip_visrect( dc, &dst.visrect, &rect )) goto done;
 
-    if (!intersect_vis_rectangles( &dst, &src )) goto done;
+    if (!intersect_vis_rectangles( &dst, &src, 1 )) goto done;
 
-    if (clip) NtGdiOffsetRgn( clip, dst.x - src.x, dst.y - src.y );
+    if (clip && dc->gdi_scale > 1)
+    {
+        if (!scale_dib_clip( clip, &src, &device_dst, dc->gdi_scale ))
+        {
+            ret = 0;
+            goto done;
+        }
+    }
+    else if (clip) NtGdiOffsetRgn( clip, dst.x - src.x, dst.y - src.y );
 
     dev = GET_DC_PHYSDEV( dc, pPutImage );
     copy_bitmapinfo( dst_info, src_info );
@@ -609,9 +629,23 @@ INT nulldrv_StretchDIBits( PHYSDEV dev, INT xDst, INT yDst, INT widthDst, INT he
 
     if (err == ERROR_TRANSFORM_NOT_SUPPORTED)
     {
+        int mode = dc->attr->stretch_blt_mode;
+
+        /* use nearest neighbor if the stretch only comes from the raster scale */
+        if (dc->gdi_scale > 1 && abs( device_dst.width ) == abs( src.width ) &&
+            abs( device_dst.height ) == abs( src.height ))
+            mode = COLORONCOLOR;
         copy_bitmapinfo( src_info, dst_info );
-        err = stretch_bits( src_info, &src, dst_info, &dst, &src_bits, dc->attr->stretch_blt_mode );
-        if (!err) err = dev->funcs->pPutImage( dev, NULL, dst_info, &src_bits, &src, &dst, rop );
+        err = stretch_bits( src_info, &src, dst_info, &dst, &src_bits, mode );
+        /* a clip region is only set for a copy that is 1:1 in device units, and with a
+         * raster scale it has been mapped to the stretched destination */
+        if (!err) err = dev->funcs->pPutImage( dev, dc->gdi_scale > 1 ? clip : NULL,
+                                               dst_info, &src_bits, &src, &dst, rop );
+        /* the visible rectangles of a stretch have rounding margins, which may leave nothing
+         * to copy when the exact intersection of an unmirrored copy is empty */
+        else if (err == ERROR_NO_DATA && dc->gdi_scale > 1 &&
+                 device_dst.width == src.width && device_dst.height == src.height)
+            err = ERROR_SUCCESS;
     }
     if (err) ret = 0;
 
@@ -850,6 +884,41 @@ INT nulldrv_SetDIBitsToDevice( PHYSDEV dev, INT x_dst, INT y_dst, DWORD cx, DWOR
     dst.width = cx;
     dst.height = cy;
     if (dc->attr->layout & LAYOUT_RTL) dst.x -= cx - 1;
+
+    if (dc->gdi_scale > 1)
+    {
+        struct bitblt_coords device_dst = dst;
+
+        /* each device pixel covers several raster pixels, stretch the bits to them */
+        scale_bitblt_coords( &dst, dc->gdi_scale );
+        get_bounding_rect( &rect, dst.x, dst.y, dst.width, dst.height );
+        if (!clip_visrect( dc, &dst.visrect, &rect )) goto done;
+        if (!intersect_vis_rectangles( &dst, &src, 1 )) goto done;
+        if (clip && !scale_dib_clip( clip, &src, &device_dst, dc->gdi_scale ))
+        {
+            lines = 0;
+            goto done;
+        }
+
+        dev = GET_DC_PHYSDEV( dc, pPutImage );
+        copy_bitmapinfo( dst_info, src_info );
+        err = dev->funcs->pPutImage( dev, clip, dst_info, &src_bits, &src, &dst, SRCCOPY );
+        if (err == ERROR_BAD_FORMAT)
+        {
+            err = convert_bits( src_info, &src, dst_info, &src_bits );
+            if (!err) err = dev->funcs->pPutImage( dev, clip, dst_info, &src_bits, &src, &dst, SRCCOPY );
+        }
+        if (err == ERROR_TRANSFORM_NOT_SUPPORTED)
+        {
+            copy_bitmapinfo( src_info, dst_info );
+            err = stretch_bits( src_info, &src, dst_info, &dst, &src_bits, COLORONCOLOR );
+            if (!err) err = dev->funcs->pPutImage( dev, clip, dst_info, &src_bits, &src, &dst, SRCCOPY );
+            /* the rounding margins of the visible rectangles may leave nothing to copy */
+            else if (err == ERROR_NO_DATA) err = ERROR_SUCCESS;
+        }
+        if (err) lines = 0;
+        goto done;
+    }
 
     rect.left = dst.x;
     rect.top = dst.y;

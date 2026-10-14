@@ -64,6 +64,7 @@ typedef struct tagDC
     struct opengl_drawable *opengl_drawable; /* GL driver drawable for the DC */
 
     RECT         device_rect;      /* rectangle for the whole device */
+    UINT         gdi_scale;        /* raster pixels per device unit (GDI scaling), never in DC_ATTR */
     int          pixel_format;     /* pixel format (for memory DCs) */
     UINT         aa_flags;         /* anti-aliasing flags to pass to GetGlyphOutline for current font */
     WCHAR        display[CCHDEVICENAME]; /* Display name when created for a specific display device */
@@ -73,6 +74,7 @@ typedef struct tagDC
     HRGN          hMetaRgn;      /* Meta region */
     HRGN          hVisRgn;       /* Visible region */
     HRGN          region;        /* Total DC region (intersection of clip and visible) */
+    HRGN          raster_region; /* gdi_scale x get_dc_region(), only when gdi_scale > 1 */
     HPEN          hPen;
     HBRUSH        hBrush;
     HFONT         hFont;
@@ -149,7 +151,7 @@ static inline BOOL is_bitmapobj_dib( const BITMAPOBJ *bmp )
 /* bitblt.c */
 extern DWORD convert_bits( const BITMAPINFO *src_info, struct bitblt_coords *src,
                            BITMAPINFO *dst_info, struct gdi_image_bits *bits );
-extern BOOL intersect_vis_rectangles( struct bitblt_coords *dst, struct bitblt_coords *src );
+extern BOOL intersect_vis_rectangles( struct bitblt_coords *dst, struct bitblt_coords *src, UINT src_scale );
 extern DWORD stretch_bits( const BITMAPINFO *src_info, struct bitblt_coords *src,
                            BITMAPINFO *dst_info, struct bitblt_coords *dst,
                            struct gdi_image_bits *bits, int mode );
@@ -163,6 +165,7 @@ extern void free_brush_pattern( struct brush_pattern *pattern );
 /* clipping.c */
 extern BOOL clip_device_rect( DC *dc, RECT *dst, const RECT *src );
 extern BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src );
+extern BOOL get_dc_raster_device_rect( DC *dc, RECT *rect );
 extern void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect,
                                 const RECT *device_rect, struct window_surface *surface );
 extern void update_dc_clipping( DC * dc );
@@ -174,6 +177,12 @@ static inline HRGN get_dc_region( DC *dc )
     if (dc->hVisRgn) return dc->hVisRgn;
     if (dc->hClipRgn) return dc->hClipRgn;
     return dc->hMetaRgn;
+}
+
+/* Return the total DC region (if any) in raster coordinates */
+static inline HRGN get_dc_raster_region( DC *dc )
+{
+    return dc->gdi_scale > 1 ? dc->raster_region : get_dc_region( dc );
 }
 
 /* dc.c */
@@ -263,6 +272,9 @@ struct gdi_font
     OUTLINETEXTMETRICW     otm;
     KERNINGPAIR           *kern_pairs;
     int                    kern_count;
+    UINT                   render_scale;   /* raster scale of the render font request below */
+    INT                    render_height;  /* lfHeight of the render font request */
+    INT                    render_width;   /* lfWidth of the render font request */
     /* the following members can be accessed without locking, they are never modified after creation */
     void                  *private;  /* font backend private data */
     struct list            child_fonts;
@@ -281,6 +293,8 @@ struct gdi_font
     SHORT                  yMax;
     SHORT                  yMin;
     UINT                   ntmFlags;
+    UINT                   weight;             /* weight of the face */
+    BOOL                   var_instance;       /* face is a named instance of a variable font */
     UINT                   ntmAvgWidth;
     UINT                   aa_flags;
     ULONG                  ttc_item_offset;    /* 0 if font is not a part of TrueType collection */
@@ -315,7 +329,12 @@ struct gdi_font
 #define ADDFONT_ADD_RESOURCE  0x08  /* added through AddFontResource */
 #define ADDFONT_VERTICAL_FONT 0x10
 #define ADDFONT_EXTERNAL_FOUND 0x20
+#define ADDFONT_VAR_INSTANCE  0x40  /* face projected from a named instance of a variable font */
 #define ADDFONT_AA_FLAGS(flags) ((flags) << 16)
+
+/* private get_glyph_outline() format flag, never accepted from applications: hint the glyph the
+ * way the host renders text (fontconfig hintstyle) instead of the GDI way */
+#define WINE_GGO_HOST_HINTING 0x80000000
 
 struct font_backend_funcs
 {
@@ -347,6 +366,10 @@ extern int add_gdi_face( const WCHAR *family_name, const WCHAR *second_name,
                          const struct bitmap_font_size *size );
 extern UINT font_init(void);
 extern const struct font_backend_funcs *init_freetype_lib(void);
+extern BOOL dc_has_render_font( DC *dc );
+extern BOOL dc_has_host_hinted_render_font( DC *dc );
+extern DWORD get_render_glyph_outline( DC *dc, UINT glyph, UINT format, GLYPHMETRICS *gm,
+                                       DWORD buflen, void *buf );
 
 /* opentype.c */
 
@@ -372,9 +395,35 @@ extern BOOL opentype_enum_style_names( const struct tt_name_v0 *tt_name_v0,
                                        opentype_enum_names_cb callback, void *user );
 extern BOOL opentype_enum_full_names( const struct tt_name_v0 *tt_name_v0,
                                       opentype_enum_names_cb callback, void *user );
+extern BOOL opentype_enum_names( const struct tt_name_v0 *tt_name_v0, USHORT name_id,
+                                 opentype_enum_names_cb callback, void *user );
 
 extern BOOL opentype_get_properties( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
                                      DWORD *version, FONTSIGNATURE *fs, DWORD *ntm_flags, UINT *weight );
+
+struct opentype_var_info
+{
+    UINT instance_count;    /* number of named instances, numbered from 1 in fvar order */
+    UINT default_instance;  /* first named instance at the default coordinates, 0 if none */
+};
+
+struct opentype_var_instance
+{
+    USHORT subfamily_name_id;  /* fvar subfamilyNameID, 0 for the default instance (index 0) */
+    BOOL is_default;           /* the coordinates are the default ones */
+    BOOL is_duplicate;         /* the coordinates are those of an earlier named instance */
+    UINT weight;               /* rounded wght coordinate, 0 if the font has no wght axis */
+    BOOL has_slant_axis;       /* the font has an ital or slnt axis */
+    BOOL italic;               /* the ital coordinate is at least 0.5 */
+    BOOL stat_valid;           /* STAT names the instance with the axis value names below */
+    UINT label_count;          /* number of non-elidable STAT axis value names */
+    USHORT label_name_ids[8];  /* their name IDs, in axis ordering */
+};
+
+extern BOOL opentype_get_var_info( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                                   struct opentype_var_info *info );
+extern BOOL opentype_get_var_instance( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                                       UINT index, struct opentype_var_instance *instance );
 
 /* gdiobj.c */
 extern HGDIOBJ alloc_gdi_handle( struct gdi_obj_header *obj, DWORD type,
@@ -392,6 +441,8 @@ extern void make_gdi_object_system( HGDIOBJ handle, BOOL set );
 /* mapping.c */
 extern BOOL dp_to_lp( DC *dc, POINT *points, INT count );
 extern void lp_to_dp( DC *dc, POINT *points, INT count );
+extern void lp_to_rp( DC *dc, POINT *points, INT count );
+extern void lp_to_rp_pixel( DC *dc, POINT *pt );
 extern BOOL set_map_mode( DC *dc, int mode );
 extern void combine_transform( XFORM *result, const XFORM *xform1,
                                const XFORM *xform2 );
@@ -421,6 +472,7 @@ extern HPEN create_pen( INT style, INT width, COLORREF color );
 /* region.c */
 extern BOOL add_rect_to_region( HRGN rgn, const RECT *rect );
 extern INT mirror_region( HRGN dst, HRGN src, INT width );
+extern INT scale_region( HRGN dst, HRGN src, UINT scale );
 extern BOOL mirror_window_region( HWND hwnd, HRGN hrgn );
 extern BOOL REGION_FrameRgn( HRGN dest, HRGN src, INT x, INT y );
 extern HRGN create_polypolygon_region( const POINT *pts, const INT *count, INT nbpolygons,
@@ -568,6 +620,39 @@ static inline void get_bounding_rect( RECT *rect, int x, int y, int width, int h
         rect->top = rect->bottom + 1;
         rect->bottom = tmp + 1;
     }
+}
+
+/* Raster coordinates are device coordinates multiplied by the GDI scaling factor of the DC:
+ * the device pixel x covers the raster pixels [x * scale, x * scale + scale). */
+static inline int scale_device_coord( int val, UINT scale )
+{
+    LONGLONG ret = (LONGLONG)val * scale;
+
+    if (ret > 0x3fffffff) return 0x3fffffff;
+    if (ret < -0x3fffffff) return -0x3fffffff;
+    return ret;
+}
+
+static inline RECT scale_rect( RECT rect, UINT scale )
+{
+    if (scale == 1) return rect;
+    rect.left   = scale_device_coord( rect.left, scale );
+    rect.top    = scale_device_coord( rect.top, scale );
+    rect.right  = scale_device_coord( rect.right, scale );
+    rect.bottom = scale_device_coord( rect.bottom, scale );
+    return rect;
+}
+
+/* Map final device coordinates to raster coordinates. A negative extent starts at the
+ * last raster pixel of its device pixel, so that get_bounding_rect() returns the scaled
+ * device rectangle. The visible rectangle is not mapped and has to be computed afterwards. */
+static inline void scale_bitblt_coords( struct bitblt_coords *coords, UINT scale )
+{
+    if (scale == 1) return;
+    coords->x = scale_device_coord( coords->x, scale ) + (coords->width < 0 ? (int)scale - 1 : 0);
+    coords->y = scale_device_coord( coords->y, scale ) + (coords->height < 0 ? (int)scale - 1 : 0);
+    coords->width  = scale_device_coord( coords->width, scale );
+    coords->height = scale_device_coord( coords->height, scale );
 }
 
 static inline void reset_bounds( RECT *bounds )

@@ -997,6 +997,7 @@ DWORD dibdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
     DWORD ret = ERROR_SUCCESS;
     dib_info src_dib;
     HRGN tmp_rgn = 0;
+    POINT brush_org;
     dibdrv_physdev *pdev = get_dibdrv_pdev( dev );
     BOOL stretch = (src->width != dst->width) || (src->height != dst->height);
 
@@ -1034,7 +1035,7 @@ DWORD dibdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
         }
         else
             ret = execute_rop( pdev, &dst->visrect, &src_dib, &src->visrect, &clipped_rects,
-                               &dc->attr->brush_org, rop );
+                               get_raster_brush_org( dc, &brush_org ), rop );
         free_clipped_rects( &clipped_rects );
     }
     free_dib_info( &src_dib );
@@ -1408,9 +1409,11 @@ BOOL dibdrv_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
                         PHYSDEV src_dev, struct bitblt_coords *src, DWORD rop )
 {
     DC *dc_dst = get_physdev_dc( dst_dev );
+    int dst_scale = dc_dst->gdi_scale, src_scale = get_physdev_dc( src_dev )->gdi_scale;
 
-    if (dst->width == 1 && src->width > 1) src->width--;
-    if (dst->height == 1 && src->height > 1) src->height--;
+    /* the coordinates are in raster pixels, but the size check is done in device pixels */
+    if (dst->width == dst_scale && src->width > src_scale) src->width -= src_scale;
+    if (dst->height == dst_scale && src->height > src_scale) src->height -= src_scale;
 
     return dc_dst->nulldrv.funcs->pStretchBlt( &dc_dst->nulldrv, dst, src_dev, src, rop );
 }
@@ -1448,7 +1451,7 @@ BOOL dibdrv_GradientFill( PHYSDEV dev, TRIVERTEX *vert_array, ULONG nvert,
         pts[i].x = vert_array[i].x;
         pts[i].y = vert_array[i].y;
     }
-    lp_to_dp( dc, pts, nvert );
+    lp_to_rp( dc, pts, nvert );
 
     switch (mode)
     {

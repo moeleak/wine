@@ -1250,6 +1250,283 @@ static BOOL null_pen_lines(dibdrv_physdev *pdev, int num, POINT *pts, BOOL close
     return TRUE;
 }
 
+/* Thin pens on raster-scaled DCs are drawn as blocks: the device pixels are computed exactly
+ * as for an unscaled DC, and each of them is drawn as a block of pen_scale x pen_scale
+ * raster pixels. */
+
+static inline int floor_div( int val, int scale )
+{
+    return val >= 0 ? val / scale : -1 - (-1 - val) / scale;
+}
+
+/* get the device pixel containing a point in raster coordinates */
+static inline POINT get_block_point( dibdrv_physdev *pdev, const POINT *pt )
+{
+    POINT ret;
+
+    ret.x = floor_div( pt->x, pdev->pen_scale );
+    ret.y = floor_div( pt->y, pdev->pen_scale );
+    return ret;
+}
+
+/* get the device pixels that can be visible in the raster DIB */
+static void get_block_bounds( dibdrv_physdev *pdev, RECT *bounds )
+{
+    const WINEREGION *region;
+    int scale = pdev->pen_scale;
+    RECT rect;
+    BOOL ret;
+
+    bounds->left = bounds->top = bounds->right = bounds->bottom = 0;
+    if (!get_dib_rect( &pdev->dib, &rect )) return;
+    if (pdev->clip)
+    {
+        if (!(region = get_wine_region( pdev->clip ))) return;
+        ret = intersect_rect( &rect, &rect, &region->extents );
+        release_wine_region( pdev->clip );
+        if (!ret) return;
+    }
+    bounds->left   = floor_div( rect.left, scale );
+    bounds->top    = floor_div( rect.top, scale );
+    bounds->right  = floor_div( rect.right - 1, scale ) + 1;
+    bounds->bottom = floor_div( rect.bottom - 1, scale ) + 1;
+}
+
+/* draw a rectangle of device pixels, or add it to the region if it's a dash mark */
+static void block_emit( dibdrv_physdev *pdev, HRGN region, const RECT *rect, BOOL mark, rop_mask mask )
+{
+    struct clipped_rects clipped_rects;
+    RECT rc = scale_rect( *rect, pdev->pen_scale );
+
+    if (region)
+    {
+        if (mark && clip_rect_to_dib( &pdev->dib, &rc )) add_rect_to_region( region, &rc );
+        return;
+    }
+    if (!get_clipped_rects( &pdev->dib, &rc, pdev->clip, &clipped_rects )) return;
+    pdev->dib.funcs->solid_rects( &pdev->dib, clipped_rects.count, clipped_rects.rects, mask.and, mask.xor );
+    free_clipped_rects( &clipped_rects );
+}
+
+/* draw the device pixels of a horizontal or vertical line, the start pixel 'pos' and
+ * the following 'count' - 1 pixels in direction 'dir' */
+static void block_pen_run( dibdrv_physdev *pdev, HRGN region, BOOL vertical, int fixed,
+                           int pos, int count, int dir, BOOL dashed, rop_mask solid, const RECT *bounds )
+{
+    int first, last, len, low, high, from, to;
+    rop_mask mask = solid;
+    BOOL mark = TRUE;
+    RECT rect;
+
+    if (vertical)
+    {
+        if (fixed < bounds->left || fixed >= bounds->right) return;
+        low = bounds->top;
+        high = bounds->bottom - 1;
+    }
+    else
+    {
+        if (fixed < bounds->top || fixed >= bounds->bottom) return;
+        low = bounds->left;
+        high = bounds->right - 1;
+    }
+
+    /* range of visible pixel indices along the line */
+    if (dir > 0)
+    {
+        first = max( 0, low - pos );
+        last = min( count - 1, high - pos );
+    }
+    else
+    {
+        first = max( 0, pos - high );
+        last = min( count - 1, pos - low );
+    }
+    if (first > last) return;
+
+    if (dashed && first) skip_dash( pdev, first );
+
+    while (first <= last)
+    {
+        len = last - first + 1;
+        if (dashed)
+        {
+            mark = pdev->dash_pos.mark;
+            mask = pdev->dash_masks[mark];
+            len = min( pdev->dash_pos.left_in_dash, len );
+        }
+
+        if (dir > 0)
+        {
+            from = pos + first;
+            to = from + len;
+        }
+        else
+        {
+            to = pos - first + 1;
+            from = to - len;
+        }
+        if (vertical)
+        {
+            rect.left   = fixed;
+            rect.top    = from;
+            rect.right  = fixed + 1;
+            rect.bottom = to;
+        }
+        else
+        {
+            rect.left   = from;
+            rect.top    = fixed;
+            rect.right  = to;
+            rect.bottom = fixed + 1;
+        }
+
+        block_emit( pdev, region, &rect, mark, mask );
+        first += len;
+        if (dashed) skip_dash( pdev, len );
+    }
+}
+
+/* draw a line of device pixels like the unscaled pen functions do, excluding the end point */
+static void block_pen_line( dibdrv_physdev *pdev, POINT start, POINT end, HRGN region,
+                            BOOL dashed, rop_mask solid, const RECT *bounds )
+{
+    const dash_pos start_pos = pdev->dash_pos;
+    int len;
+
+    if (start.y == end.y)
+    {
+        len = abs( end.x - start.x );
+        block_pen_run( pdev, region, FALSE, start.y, start.x, len, start.x <= end.x ? 1 : -1,
+                       dashed, solid, bounds );
+    }
+    else if (start.x == end.x)
+    {
+        len = abs( end.y - start.y );
+        block_pen_run( pdev, region, TRUE, start.x, start.y, len, start.y <= end.y ? 1 : -1,
+                       dashed, solid, bounds );
+    }
+    else
+    {
+        bres_params clip_params;
+        struct line_params line_params;
+        POINT p1 = crop_coords( start ), p2 = crop_coords( end ), pt, clipped_end;
+        rop_mask mask = solid;
+        BOOL mark = TRUE;
+        RECT rect;
+
+        init_bres_params( &p1, &p2, &clip_params, &line_params, &rect );
+        if (intersect_rect( &rect, &rect, bounds ) &&
+            clip_line( &p1, &p2, &rect, &clip_params, &pt, &clipped_end ))
+        {
+            int m = abs( pt.x - p1.x );
+            int n = abs( pt.y - p1.y );
+            int err;
+
+            if (line_params.x_major)
+            {
+                err = 2 * clip_params.dy - clip_params.dx + m * 2 * clip_params.dy - n * 2 * clip_params.dx;
+                len = abs( clipped_end.x - pt.x ) + 1;
+                if (dashed) skip_dash( pdev, m );
+            }
+            else
+            {
+                err = 2 * clip_params.dx - clip_params.dy + n * 2 * clip_params.dx - m * 2 * clip_params.dy;
+                len = abs( clipped_end.y - pt.y ) + 1;
+                if (dashed) skip_dash( pdev, n );
+            }
+            if (clipped_end.x == p2.x && clipped_end.y == p2.y) len--;
+            /* solid_line_region() also covers the pixel following the last one */
+            if (region && !dashed) len++;
+
+            while (len--)
+            {
+                if (dashed)
+                {
+                    mark = pdev->dash_pos.mark;
+                    mask = pdev->dash_masks[mark];
+                    skip_dash( pdev, 1 );
+                }
+                rect.left   = pt.x;
+                rect.top    = pt.y;
+                rect.right  = pt.x + 1;
+                rect.bottom = pt.y + 1;
+                block_emit( pdev, region, &rect, mark, mask );
+
+                if (line_params.x_major)
+                {
+                    if (err + line_params.bias > 0)
+                    {
+                        pt.y += line_params.y_inc;
+                        err += line_params.err_add_1;
+                    }
+                    else err += line_params.err_add_2;
+                    pt.x += line_params.x_inc;
+                }
+                else
+                {
+                    if (err + line_params.bias > 0)
+                    {
+                        pt.x += line_params.x_inc;
+                        err += line_params.err_add_1;
+                    }
+                    else err += line_params.err_add_2;
+                    pt.y += line_params.y_inc;
+                }
+            }
+        }
+        len = line_params.x_major ? clip_params.dx : clip_params.dy;
+    }
+
+    if (dashed)
+    {
+        pdev->dash_pos = start_pos;
+        skip_dash( pdev, len );
+    }
+}
+
+static BOOL block_pen_lines( dibdrv_physdev *pdev, int num, POINT *pts, BOOL close, HRGN region,
+                             BOOL dashed )
+{
+    DC *dc = get_physdev_dc( &pdev->dev );
+    rop_mask solid = { 0, 0 };
+    RECT bounds;
+    int i;
+
+    assert( num >= 2 );
+
+    if (!region)
+    {
+        if (dashed)
+            get_color_masks( dc, &pdev->dib, dc->attr->rop_mode, pdev->pen_brush.colorref,
+                             pdev->pen_is_ext ? TRANSPARENT : dc->attr->background_mode,
+                             &pdev->dash_masks[1], &pdev->dash_masks[0] );
+        else
+            calc_rop_masks( dc->attr->rop_mode,
+                            get_pixel_color( dc, &pdev->dib, pdev->pen_brush.colorref, TRUE ), &solid );
+    }
+
+    get_block_bounds( pdev, &bounds );
+
+    for (i = 0; i < num - 1; i++)
+        block_pen_line( pdev, get_block_point( pdev, pts + i ), get_block_point( pdev, pts + i + 1 ),
+                        region, dashed, solid, &bounds );
+    if (close)
+        block_pen_line( pdev, get_block_point( pdev, pts + num - 1 ), get_block_point( pdev, pts ),
+                        region, dashed, solid, &bounds );
+    return TRUE;
+}
+
+static BOOL block_solid_pen_lines( dibdrv_physdev *pdev, int num, POINT *pts, BOOL close, HRGN region )
+{
+    return block_pen_lines( pdev, num, pts, close, region, FALSE );
+}
+
+static BOOL block_dashed_pen_lines( dibdrv_physdev *pdev, int num, POINT *pts, BOOL close, HRGN region )
+{
+    return block_pen_lines( pdev, num, pts, close, region, TRUE );
+}
+
 struct face
 {
     POINT start, end;
@@ -1830,12 +2107,67 @@ static void free_brush_mask_bits( dib_brush *brush )
 {
     if (brush->masks.xor != brush->dib.bits.ptr) free( brush->masks.xor );
     brush->masks.and = brush->masks.xor = NULL;
+    free( brush->scaled_masks.xor );
+    brush->scaled_masks.and = brush->scaled_masks.xor = NULL;
+    brush->scaled_scale = 0;
 }
 
 void free_pattern_brush( dib_brush *brush )
 {
     free_brush_mask_bits( brush );
     free_dib_info( &brush->dib );
+}
+
+/* fill a width x height 32-bpp mask with scale x scale blocks of the src pixels */
+static void scale_mask_bits( DWORD *dst, const DWORD *src, int src_stride,
+                             int width, int height, int scale )
+{
+    int x, y;
+
+    for (y = 0; y < height; y++, dst += width)
+        for (x = 0; x < width; x++) dst[x] = src[(y / scale) * src_stride + x / scale];
+}
+
+/* Patterns are tiled in raster pixels, so a raster-scaled DC uses masks where
+ * each pixel is replicated, to keep the pattern in device pixels. Only 32-bpp
+ * brushes are scaled, which covers all the window surfaces. */
+static BOOL scale_brush_masks( dib_brush *brush, UINT scale )
+{
+    int width = brush->dib.width, height = brush->dib.height;
+    UINT64 size;
+    DWORD *bits;
+
+    assert( brush->dib.bit_count == 32 );
+    assert( brush->dib.stride > 0 );
+
+    free( brush->scaled_masks.xor );
+    brush->scaled_masks.and = brush->scaled_masks.xor = NULL;
+    brush->scaled_scale = 0;
+
+    if (width > INT_MAX / 4 / scale || height > INT_MAX / scale) return FALSE;
+    width *= scale;
+    height *= scale;
+    size = (UINT64)width * 4 * height;
+    if (size > INT_MAX / 2) return FALSE;
+    if (!(bits = malloc( brush->masks.and ? 2 * size : size ))) return FALSE;
+
+    brush->scaled_masks.xor = bits;
+    scale_mask_bits( bits, brush->masks.xor, brush->dib.stride / 4, width, height, scale );
+    if (brush->masks.and)
+    {
+        brush->scaled_masks.and = (char *)bits + size;
+        scale_mask_bits( brush->scaled_masks.and, brush->masks.and, brush->dib.stride / 4,
+                         width, height, scale );
+    }
+
+    brush->scaled_dib = brush->dib;
+    brush->scaled_dib.width  = width;
+    brush->scaled_dib.height = height;
+    brush->scaled_dib.stride = width * 4;
+    SetRect( &brush->scaled_dib.rect, 0, 0, width, height );
+    memset( &brush->scaled_dib.bits, 0, sizeof(brush->scaled_dib.bits) );  /* only the masks are used */
+    brush->scaled_scale = scale;
+    return TRUE;
 }
 
 static BOOL create_pattern_brush_bits( dib_brush *brush )
@@ -2039,7 +2371,8 @@ static BOOL select_pattern_brush( dibdrv_physdev *pdev, dib_brush *brush, BOOL *
 static BOOL pattern_brush(dibdrv_physdev *pdev, dib_brush *brush, dib_info *dib,
                           int num, const RECT *rects, const POINT *brush_org, INT rop)
 {
-    BOOL needs_reselect = FALSE;
+    UINT scale = get_physdev_dc( &pdev->dev )->gdi_scale;
+    BOOL needs_reselect = FALSE, ret = TRUE;
 
     if (rop != brush->rop)
     {
@@ -2074,10 +2407,19 @@ static BOOL pattern_brush(dibdrv_physdev *pdev, dib_brush *brush, dib_info *dib,
         }
     }
 
-    dib->funcs->pattern_rects( dib, num, rects, brush_org, &brush->dib, &brush->masks );
+    if (scale > 1 && brush->dib.bit_count == 32)
+    {
+        if (brush->scaled_scale == scale || scale_brush_masks( brush, scale ))
+            dib->funcs->pattern_rects( dib, num, rects, brush_org,
+                                       &brush->scaled_dib, &brush->scaled_masks );
+        else
+            ret = FALSE;
+    }
+    else
+        dib->funcs->pattern_rects( dib, num, rects, brush_org, &brush->dib, &brush->masks );
 
     if (needs_reselect) free_pattern_brush( brush );
-    return TRUE;
+    return ret;
 }
 
 static BOOL null_brush(dibdrv_physdev *pdev, dib_brush *brush, dib_info *dib,
@@ -2163,6 +2505,7 @@ HPEN dibdrv_SelectPen( PHYSDEV dev, HPEN hpen, const struct brush_pattern *patte
     LOGBRUSH logbrush;
     EXTLOGPEN *elp = NULL;
     BOOL dither = TRUE;
+    int width;  /* in device pixels */
 
     TRACE("(%p, %p)\n", dev, hpen);
 
@@ -2195,7 +2538,9 @@ HPEN dibdrv_SelectPen( PHYSDEV dev, HPEN hpen, const struct brush_pattern *patte
 
     pdev->pen_join   = logpen.lopnStyle & PS_JOIN_MASK;
     pdev->pen_endcap = logpen.lopnStyle & PS_ENDCAP_MASK;
-    pdev->pen_width  = get_pen_device_width( dc, logpen.lopnWidth.x );
+    pdev->pen_scale  = dc->gdi_scale;
+    width = get_pen_device_width( dc, logpen.lopnWidth.x );
+    pdev->pen_width  = width * pdev->pen_scale;
 
     if (hpen == GetStockObject( DC_PEN ))
         logbrush.lbColor = dc->attr->pen_color;
@@ -2214,7 +2559,7 @@ HPEN dibdrv_SelectPen( PHYSDEV dev, HPEN hpen, const struct brush_pattern *patte
         if (logpen.lopnStyle & PS_GEOMETRIC)
         {
             pdev->pen_pattern = dash_patterns_geometric[pdev->pen_style - 1];
-            if (pdev->pen_width > 1)
+            if (width > 1)
             {
                 scale_dash_pattern( &pdev->pen_pattern, pdev->pen_width, pdev->pen_endcap );
                 pdev->pen_lines = dashed_wide_pen_lines;
@@ -2222,7 +2567,7 @@ HPEN dibdrv_SelectPen( PHYSDEV dev, HPEN hpen, const struct brush_pattern *patte
             else pdev->pen_lines = dashed_pen_lines;
             break;
         }
-        if (pdev->pen_width == 1)  /* wide cosmetic pens are not dashed */
+        if (width == 1)  /* wide cosmetic pens are not dashed */
         {
             pdev->pen_lines = dashed_pen_lines;
             pdev->pen_pattern = dash_patterns_cosmetic[pdev->pen_style - 1];
@@ -2231,11 +2576,11 @@ HPEN dibdrv_SelectPen( PHYSDEV dev, HPEN hpen, const struct brush_pattern *patte
         /* fall through */
     case PS_SOLID:
     case PS_INSIDEFRAME:
-        pdev->pen_lines = (pdev->pen_width == 1) ? solid_pen_lines : wide_pen_lines;
+        pdev->pen_lines = (width == 1) ? solid_pen_lines : wide_pen_lines;
         break;
 
     case PS_NULL:
-        pdev->pen_width = 0;
+        pdev->pen_width = width = 0;
         pdev->pen_lines = null_pen_lines;
         break;
 
@@ -2245,13 +2590,23 @@ HPEN dibdrv_SelectPen( PHYSDEV dev, HPEN hpen, const struct brush_pattern *patte
         break;
 
     case PS_USERSTYLE:
-        pdev->pen_lines = (pdev->pen_width == 1) ? dashed_pen_lines : dashed_wide_pen_lines;
+        pdev->pen_lines = (width == 1) ? dashed_pen_lines : dashed_wide_pen_lines;
         set_dash_pattern( &pdev->pen_pattern, elp->elpNumEntries, elp->elpStyleEntry );
         if (!(logpen.lopnStyle & PS_GEOMETRIC)) scale_dash_pattern( &pdev->pen_pattern, 3, PS_ENDCAP_FLAT );
+        else if (width > 1 && pdev->pen_scale > 1)
+            scale_dash_pattern( &pdev->pen_pattern, pdev->pen_scale, PS_ENDCAP_FLAT );
         break;
     }
 
-    pdev->pen_uses_region = (logpen.lopnStyle & PS_GEOMETRIC || pdev->pen_width > 1);
+    if (pdev->pen_scale > 1 && width == 1)
+    {
+        /* thin pens cover the raster pixels of the device pixels they would draw at 1x */
+        if (pdev->pen_lines == solid_pen_lines) pdev->pen_lines = block_solid_pen_lines;
+        else if (pdev->pen_lines == dashed_pen_lines) pdev->pen_lines = block_dashed_pen_lines;
+    }
+
+    pdev->pen_device_width = width;
+    pdev->pen_uses_region = (logpen.lopnStyle & PS_GEOMETRIC || width > 1);
     pdev->pen_is_ext = (elp != NULL);
     free( elp );
     return hpen;

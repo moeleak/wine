@@ -54,6 +54,7 @@ struct font_physdev
 {
     struct gdi_physdev dev;
     struct gdi_font   *font;
+    struct gdi_font   *render_font;  /* same face realized at the raster scale of the DC, if any */
 };
 
 static inline struct font_physdev *get_font_dev( PHYSDEV dev )
@@ -1083,7 +1084,7 @@ static int remove_font( const WCHAR *file, DWORD flags )
         LIST_FOR_EACH_ENTRY_SAFE( face, face_next, &family->faces, struct gdi_font_face, entry )
         {
             if (!face->file) continue;
-            if (LOWORD(face->flags) != LOWORD(flags)) continue;
+            if (LOWORD( face->flags & ~ADDFONT_VAR_INSTANCE ) != LOWORD( flags )) continue;
             if (!wcsicmp( face->file, file ))
             {
                 TRACE( "removing matching face %s refcount %d\n", debugstr_w(face->file), face->refcount );
@@ -1333,10 +1334,10 @@ static void load_face_from_cache( HKEY hkey_family, struct gdi_font_family *fami
 
 static void load_font_list_from_cache(void)
 {
-    WCHAR buffer[4096];
+    WCHAR buffer[4096], family_name[LF_FACESIZE];
     KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
     KEY_NODE_INFORMATION *enum_info = (KEY_NODE_INFORMATION *)buffer;
-    DWORD family_index = 0, total_size;
+    DWORD family_index = 0, total_size, len;
     struct gdi_font_family *family;
     HKEY hkey_family;
     WCHAR *second_name = (WCHAR *)info->Data;
@@ -1348,10 +1349,15 @@ static void load_font_list_from_cache(void)
                                           enum_info->NameLength )))
             continue;
         TRACE( "opened family key %s\n", debugstr_wn(enum_info->Name, enum_info->NameLength / sizeof(WCHAR)) );
+        /* buffer is reused below, keep the family name */
+        len = min( enum_info->NameLength / sizeof(WCHAR), LF_FACESIZE - 1 );
+        memcpy( family_name, enum_info->Name, len * sizeof(WCHAR) );
+        family_name[len] = 0;
         if (!query_reg_value( hkey_family, NULL, info, sizeof(buffer) ))
             second_name[0] = 0;
 
-        family = create_family( buffer, second_name );
+        if ((family = find_family_from_name( family_name ))) family->refcount++;
+        else family = create_family( family_name, second_name );
 
         load_face_from_cache( hkey_family, family, buffer, sizeof(buffer), TRUE );
 
@@ -2468,6 +2474,8 @@ static struct gdi_font *create_gdi_font( const struct gdi_font_face *face, const
     font->scalable = face->scalable;
     font->face_index = face->face_index;
     font->ntmFlags = face->ntmFlags;
+    font->weight = face->weight;
+    font->var_instance = !!(face->flags & ADDFONT_VAR_INSTANCE);
     font->aa_flags = HIWORD( face->flags );
     if (!family_name) family_name = face->family->family_name;
     font->otm.otmpFamilyName = (char *)wcsdup( family_name );
@@ -2878,14 +2886,12 @@ static struct gdi_font *find_cached_gdi_font( const LOGFONTW *lf, const FMAT2 *m
     return NULL;
 }
 
-static void release_gdi_font( struct gdi_font *font )
+/* font_lock must be held */
+static void release_gdi_font_nolock( struct gdi_font *font )
 {
-    if (!font) return;
-
     TRACE( "font %p\n", font );
 
     /* add it to the unused list */
-    pthread_mutex_lock( &font_lock );
     if (!--font->refcount)
     {
         list_add_head( &unused_gdi_font_list, &font->unused_entry );
@@ -2899,6 +2905,14 @@ static void release_gdi_font( struct gdi_font *font )
         }
         else unused_font_count++;
     }
+}
+
+static void release_gdi_font( struct gdi_font *font )
+{
+    if (!font) return;
+
+    pthread_mutex_lock( &font_lock );
+    release_gdi_font_nolock( font );
     pthread_mutex_unlock( &font_lock );
 }
 
@@ -3175,6 +3189,7 @@ static BOOL font_DeleteDC( PHYSDEV dev )
     struct font_physdev *physdev = get_font_dev( dev );
 
     release_gdi_font( physdev->font );
+    release_gdi_font( physdev->render_font );
     free( physdev );
     return TRUE;
 }
@@ -4066,6 +4081,8 @@ static DWORD font_GetGlyphOutline( PHYSDEV dev, UINT glyph, UINT format,
     struct font_physdev *physdev = get_font_dev( dev );
     DWORD ret;
 
+    if (format & WINE_GGO_HOST_HINTING) return GDI_ERROR;  /* private to the internal rasterizers */
+
     if (!physdev->font)
     {
         dev = GET_NEXT_PHYSDEV( dev, pGetGlyphOutline );
@@ -4316,12 +4333,17 @@ static INT font_GetTextFace( PHYSDEV dev, INT count, WCHAR *str )
 }
 
 
+static BOOL is_ave_width_too_large( INT width, const TEXTMETRICW *tm )
+{
+    return width && (width + tm->tmHeight - 1) / tm->tmHeight > 100;
+}
+
 static void scale_font_metrics( struct gdi_font *font, TEXTMETRICW *tm )
 {
     double scale_x, scale_y;
 
     /* Make sure that the font has sane width/height ratio */
-    if (font->aveWidth && (font->aveWidth + tm->tmHeight - 1) / tm->tmHeight > 100)
+    if (is_ave_width_too_large( font->aveWidth, tm ))
     {
         WARN( "Ignoring too large font->aveWidth %d\n", font->aveWidth );
         font->aveWidth = 0;
@@ -4518,6 +4540,143 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
     return font;
 }
 
+/* select a scalable font using the same face as font; font_lock must be held */
+static struct gdi_font *select_font_same_face( const struct gdi_font *font, LOGFONTW *lf, FMAT2 dcmat,
+                                               BOOL can_use_bitmap )
+{
+    struct gdi_font *ret = select_font( lf, dcmat, can_use_bitmap );
+
+    if (ret && (!ret->scalable || ret->face_index != font->face_index ||
+                ret->data_ptr != font->data_ptr || wcscmp( ret->file, font->file )))
+    {
+        release_gdi_font_nolock( ret );
+        ret = NULL;
+    }
+    /* another face may be preferred because of its bitmap sizes */
+    if (!ret && can_use_bitmap) ret = select_font_same_face( font, lf, dcmat, FALSE );
+    return ret;
+}
+
+/* select the face of font at the given ppem; with a positive lf->lfHeight, try up to
+ * the given number of cell heights from there towards that ppem; font_lock must be held */
+static struct gdi_font *select_font_same_face_ppem( const struct gdi_font *font, LOGFONTW *lf, FMAT2 dcmat,
+                                                    BOOL can_use_bitmap, INT ppem, UINT tries )
+{
+    struct gdi_font *ret;
+    INT step, dir = 0;
+
+    while ((ret = select_font_same_face( font, lf, dcmat, can_use_bitmap )))
+    {
+        if (ret->ppem == ppem) return ret;
+        step = ret->ppem < ppem ? 1 : -1;
+        release_gdi_font_nolock( ret );
+        /* stop when no cell height gives that ppem */
+        if (!--tries || step == -dir || lf->lfHeight + step <= 0) break;
+        dir = step;
+        lf->lfHeight += step;
+    }
+    return NULL;
+}
+
+/* realize the face of font at scale times its size, for rasterizing on a
+ * raster scaled DC; font_lock must be held */
+static struct gdi_font *select_render_font( struct gdi_font *font, const LOGFONTW *lf, FMAT2 dcmat,
+                                            BOOL can_use_bitmap, UINT scale )
+{
+    struct gdi_font *render = NULL, *fixed;
+    LOGFONTW render_lf = *lf;
+    FMAT2 render_mat = dcmat;
+    INT ppem = font->ppem, width = font->aveWidth, render_width;
+    static int once;
+
+    if (!font->scalable) return NULL;
+
+    /* the font is drawn without its width if that is too large, see scale_font_metrics */
+    if ((font_funcs->set_outline_text_metrics( font ) || font_funcs->set_bitmap_text_metrics( font )) &&
+        is_ave_width_too_large( width, &font->otm.otmTextMetrics ))
+        width = 0;
+
+    if (dcmat.eM12 == 0.0 && dcmat.eM21 == 0.0 && fabs( dcmat.eM11 ) == 1.0 && fabs( dcmat.eM22 ) == 1.0)
+    {
+        /* request exactly scale times the em square */
+        if (ppem <= 0 || ppem > 0xffff / (INT)scale || width < 0 || width > INT_MAX / (INT)scale)
+            return NULL;
+        ppem *= scale;
+
+        /* use the request found for this scale by a previous call */
+        if (font->render_scale == scale)
+        {
+            render_lf.lfHeight = font->render_height;
+            render_lf.lfWidth = font->render_width;
+            render = select_font_same_face_ppem( font, &render_lf, render_mat, can_use_bitmap, ppem, 1 );
+        }
+        if (!render)
+        {
+            render_lf.lfWidth = width * scale;
+
+            /* the linked fonts compute their own em square from a cell height, so look for
+             * a cell height giving that em square close to scale times that of the font */
+            if (lf->lfHeight >= 0 && lf->lfHeight <= 0xffff)
+            {
+                render_lf.lfHeight = (INT)scale * (lf->lfHeight ? lf->lfHeight : 16);
+                render = select_font_same_face_ppem( font, &render_lf, render_mat, can_use_bitmap,
+                                                     ppem, 2 * scale );
+            }
+            /* FIXME: otherwise the linked fonts get the em square of the font, not their own one */
+            if (!render)
+            {
+                render_lf.lfHeight = -ppem;
+                render = select_font_same_face_ppem( font, &render_lf, render_mat, can_use_bitmap, ppem, 1 );
+            }
+
+            /* the width ratio is relative to the average char width, which is rounded at
+             * each size, so request a width that gives the ratio of the font */
+            if (render && width && (font_funcs->set_outline_text_metrics( render ) ||
+                                    font_funcs->set_bitmap_text_metrics( render )))
+            {
+                render_width = muldiv( width, render->otm.otmTextMetrics.tmAveCharWidth,
+                                       font->otm.otmTextMetrics.tmAveCharWidth );
+                if (render_width > 0 && render_width != render_lf.lfWidth)
+                {
+                    render_lf.lfWidth = render_width;
+                    if ((fixed = select_font_same_face_ppem( font, &render_lf, render_mat, can_use_bitmap,
+                                                             ppem, 1 )))
+                    {
+                        release_gdi_font_nolock( render );
+                        render = fixed;
+                    }
+                }
+            }
+
+            if (render)
+            {
+                font->render_scale = scale;
+                font->render_height = render->lf.lfHeight;
+                font->render_width = render->lf.lfWidth;
+            }
+        }
+    }
+    else
+    {
+        /* the em square stays the same, so the width ratio does too */
+        render_lf.lfWidth = width;
+        render_mat.eM11 *= scale;
+        render_mat.eM12 *= scale;
+        render_mat.eM21 *= scale;
+        render_mat.eM22 *= scale;
+        render = select_font_same_face_ppem( font, &render_lf, render_mat, can_use_bitmap, ppem, 1 );
+    }
+
+    if (!render)
+    {
+        if (!once++) WARN( "failed to realize %s at scale %u\n", debugstr_w(font->lf.lfFaceName), scale );
+        return NULL;
+    }
+    TRACE( "font %p ppem %d scale %u -> render font %p ppem %d height %d width %d\n", font, font->ppem,
+           scale, render, render->ppem, render->lf.lfHeight, render->lf.lfWidth );
+    return render;
+}
+
 /*************************************************************
  * font_SelectFont
  */
@@ -4525,6 +4684,7 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
 {
     struct font_physdev *physdev = get_font_dev( dev );
     struct gdi_font *font = NULL, *prev = physdev->font;
+    struct gdi_font *render = NULL, *prev_render = physdev->render_font;
     DC *dc = get_physdev_dc( dev );
 
     if (hfont)
@@ -4584,6 +4744,8 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
         pthread_mutex_lock( &font_lock );
 
         font = select_font( &lf, dcmat, can_use_bitmap );
+        if (font && dc->gdi_scale > 1)
+            render = select_render_font( font, &lf, dcmat, can_use_bitmap, dc->gdi_scale );
 
         if (font)
         {
@@ -4595,14 +4757,80 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
                 else
                     *aa_flags = font_smoothing;
             }
-            *aa_flags = font_funcs->get_aa_flags( font, *aa_flags, antialias_fakes );
+            *aa_flags = font_funcs->get_aa_flags( render ? render : font, *aa_flags, antialias_fakes );
         }
         TRACE( "%p %s %d aa %x\n", hfont, debugstr_w(lf.lfFaceName), lf.lfHeight, *aa_flags );
         pthread_mutex_unlock( &font_lock );
     }
     physdev->font = font;
+    physdev->render_font = render;
     if (prev) release_gdi_font( prev );
+    release_gdi_font( prev_render );
     return font ? hfont : 0;
+}
+
+
+static struct gdi_font *get_dc_render_font( DC *dc )
+{
+    PHYSDEV dev = find_dc_driver( dc, &font_driver );
+
+    return dev ? get_font_dev( dev )->render_font : NULL;
+}
+
+/* symbol fonts such as Marlett draw window elements, not text */
+static BOOL is_host_hinted_render_font( const struct gdi_font *font )
+{
+    return font->charset != SYMBOL_CHARSET;
+}
+
+/*************************************************************
+ * dc_has_render_font
+ *
+ * Whether glyphs for a raster scaled DC can be rendered by its render font.
+ */
+BOOL dc_has_render_font( DC *dc )
+{
+    return get_dc_render_font( dc ) != NULL;
+}
+
+/*************************************************************
+ * dc_has_host_hinted_render_font
+ *
+ * Whether the DC has a render font whose glyphs are hinted the way the host
+ * renders text, see get_render_glyph_outline.
+ */
+BOOL dc_has_host_hinted_render_font( DC *dc )
+{
+    struct gdi_font *font = get_dc_render_font( dc );
+
+    return font && is_host_hinted_render_font( font );
+}
+
+/*************************************************************
+ * get_render_glyph_outline
+ *
+ * Same as NtGdiGetGlyphOutline with an identity matrix, using the render font.
+ * Its glyphs are only drawn on raster scaled DCs and are never seen by
+ * applications, which get the metrics and outlines of the unscaled font. So
+ * they are hinted the way the host renders text (WINE_GGO_HOST_HINTING),
+ * except for symbol fonts. gm describes the returned bits, including the
+ * render glyph's own advance, which is not scale times the unscaled advance.
+ * Code that places the glyph in the unscaled layout, such as
+ * center_scaled_glyph, has to use this gm and never GGO_METRICS of the render
+ * font, which is hinted differently.
+ */
+DWORD get_render_glyph_outline( DC *dc, UINT glyph, UINT format, GLYPHMETRICS *gm,
+                                DWORD buflen, void *buf )
+{
+    struct gdi_font *font = get_dc_render_font( dc );
+    DWORD ret;
+
+    if (!font) return GDI_ERROR;
+    if (is_host_hinted_render_font( font )) format |= WINE_GGO_HOST_HINTING;
+    pthread_mutex_lock( &font_lock );
+    ret = get_glyph_outline( font, glyph & 0xffff, format, gm, NULL, buflen, buf, NULL );
+    pthread_mutex_unlock( &font_lock );
+    return ret;
 }
 
 
@@ -5764,6 +5992,42 @@ static inline int get_line_width( DC *dc, int metric_size )
 }
 
 /***********************************************************************
+ *           get_glyph_advances
+ *
+ * Get the device advances of the glyphs of a string from the metrics of the
+ * unscaled font, as used by GetTextExtentExPoint. Note that the DIB engine
+ * advances unscaled monochrome glyphs by the metrics of their bitmaps instead,
+ * which can be hinted differently.
+ */
+static POINT *get_glyph_advances( DC *dc, const WCHAR *str, UINT count, UINT flags )
+{
+    PHYSDEV dev = GET_DC_PHYSDEV( dc, pGetGlyphOutline );
+    UINT format = GGO_METRICS, i, j;
+    GLYPHMETRICS gm;
+    POINT *advances;
+
+    if (flags & ETO_GLYPH_INDEX) format |= GGO_GLYPH_INDEX;
+    if (!(advances = malloc( count * sizeof(*advances) ))) return NULL;
+
+    for (i = 0; i < count; i++)
+    {
+        /* same fallback glyphs as the DIB engine */
+        UINT indices[3] = { str[i], 0, 0x20 };
+
+        advances[i].x = advances[i].y = 0;
+        for (j = 0; j < ARRAY_SIZE(indices); j++)
+        {
+            if (dev->funcs->pGetGlyphOutline( dev, indices[j], format, &gm, 0, NULL, &identity ) == GDI_ERROR)
+                continue;
+            advances[i].x = gm.gmCellIncX;
+            advances[i].y = gm.gmCellIncY;
+            break;
+        }
+    }
+    return advances;
+}
+
+/***********************************************************************
  *           NtGdiExtTextOutW    (win32u.@)
  *
  * Draws text using the currently selected font, background color, and text color.
@@ -5986,6 +6250,11 @@ BOOL WINAPI NtGdiExtTextOutW( HDC hdc, INT x, INT y, UINT flags, const RECT *lpr
                 desired[1].y = -desired[1].y;
         }
         width = desired[1];
+
+        /* on raster scaled DCs, the glyphs are positioned at their unscaled advances */
+        if (dc->gdi_scale > 1 && physdev->funcs != &path_driver &&
+            (deltas = get_glyph_advances( dc, str, count, flags )))
+            flags |= ETO_PDY;
     }
 
     tm.tmAscent = abs(INTERNAL_YWSTODS(dc, tm.tmAscent));
@@ -6589,7 +6858,7 @@ static void update_external_font_keys(void)
     if (!(hkey = reg_create_key( wine_fonts_key, external_fontsW, sizeof(external_fontsW), 0, NULL )))
         return;
 
-    while (reg_enum_value( hkey, i++, info, sizeof(buffer), value, LF_FULLFACESIZE * sizeof(WCHAR) ))
+    while (reg_enum_value( hkey, i++, info, sizeof(buffer), value, sizeof(value) ))
     {
         if (info->Type != REG_SZ) continue;
 
@@ -6631,7 +6900,7 @@ static void update_external_font_keys(void)
             if (!(face->flags & ADDFONT_EXTERNAL_FONT)) continue;
             if ((face->flags & ADDFONT_EXTERNAL_FOUND)) continue;
 
-            lstrcpyW( value, face->full_name );
+            lstrcpynW( value, face->full_name, LF_FULLFACESIZE );
             if (face->scalable) lstrcatW( value, true_type_suffixW );
 
             if (face->file[0] == '\\')

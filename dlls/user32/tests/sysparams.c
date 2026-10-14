@@ -51,6 +51,7 @@ static BOOL (WINAPI *pPhysicalToLogicalPointForPerMonitorDPI)(HWND,POINT*);
 static LONG (WINAPI *pGetAutoRotationState)(PAR_STATE);
 static BOOL (WINAPI *pAreDpiAwarenessContextsEqual)(DPI_AWARENESS_CONTEXT,DPI_AWARENESS_CONTEXT);
 static LONG (WINAPI *pGetDpiFromDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+static DPI_AWARENESS_CONTEXT (WINAPI *pGetDpiAwarenessContextForProcess)(HANDLE);
 
 static BOOL strict;
 static int dpi, real_dpi;
@@ -4019,6 +4020,191 @@ static void test_SetProcessDpiAwarenessContext( ULONG arg )
     winetest_pop_context();
 }
 
+static void test_app_compat_layer_child( int arg )
+{
+    DPI_AWARENESS_CONTEXT expect_ctx = LongToHandle( arg ), ctx, window_ctx;
+    HWND hwnd;
+
+    winetest_push_context( "%d", arg );
+
+    ctx = pGetThreadDpiAwarenessContext();
+    ok( pAreDpiAwarenessContextsEqual( ctx, expect_ctx ) ||
+        broken( pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_UNAWARE ) ) /* shim engine not applied */ ||
+        broken( expect_ctx == DPI_AWARENESS_CONTEXT_SYSTEM_AWARE && /* HIGHDPIAWARE is per-monitor on Win10 1703+ */
+                (pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE ) ||
+                 pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 )) ),
+        "got %p\n", ctx );
+
+    hwnd = CreateWindowExA( 0, "static", "Test", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100,
+                            0, 0, GetModuleHandleA( 0 ), NULL );
+    ok( hwnd != 0, "failed to create window\n" );
+    window_ctx = pGetWindowDpiAwarenessContext( hwnd );
+    ok( pAreDpiAwarenessContextsEqual( window_ctx, ctx ), "got window context %p / %p\n", window_ctx, ctx );
+    DestroyWindow( hwnd );
+
+    winetest_pop_context();
+}
+
+static void test_app_compat_layer( char **argv, const char *flags, int expect )
+{
+    static const char compat_key[] = "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags";
+    static const char layers_key[] = "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers";
+    char path[MAX_PATH], name[MAX_PATH], args[64], *p;
+    DWORD compat_disposition, layers_disposition;
+    HKEY compat, key;
+    LONG ret;
+
+    winetest_push_context( "%s", flags );
+
+    /* AppCompatFlags doesn't exist by default on Wine, remove it again if we create it */
+    ret = RegCreateKeyExA( HKEY_CURRENT_USER, compat_key, 0, NULL, 0, KEY_CREATE_SUB_KEY, NULL,
+                           &compat, &compat_disposition );
+    ok( !ret, "RegCreateKeyExA failed, error %ld\n", ret );
+    if (ret)
+    {
+        winetest_pop_context();
+        return;
+    }
+    ret = RegCreateKeyExA( compat, "Layers", 0, NULL, 0, KEY_SET_VALUE, NULL, &key, &layers_disposition );
+    ok( !ret, "RegCreateKeyExA failed, error %ld\n", ret );
+    RegCloseKey( compat );
+    if (ret)
+    {
+        if (compat_disposition == REG_CREATED_NEW_KEY) RegDeleteKeyA( HKEY_CURRENT_USER, compat_key );
+        winetest_pop_context();
+        return;
+    }
+
+    /* Windows looks up the full image path, Wine the lowercased file name */
+    GetModuleFileNameA( NULL, path, sizeof(path) );
+    p = strrchr( path, '\\' );
+    strcpy( name, p ? p + 1 : path );
+    CharLowerA( name );
+
+    ret = RegSetValueExA( key, name, 0, REG_SZ, (const BYTE *)flags, strlen( flags ) + 1 );
+    ok( !ret, "RegSetValueExA failed, error %ld\n", ret );
+    ret = RegSetValueExA( key, path, 0, REG_SZ, (const BYTE *)flags, strlen( flags ) + 1 );
+    ok( !ret, "RegSetValueExA failed, error %ld\n", ret );
+
+    sprintf( args, "AppCompatLayer %d", expect );
+    run_in_process( argv, args );
+
+    RegDeleteValueA( key, name );
+    RegDeleteValueA( key, path );
+    RegCloseKey( key );
+    if (layers_disposition == REG_CREATED_NEW_KEY) RegDeleteKeyA( HKEY_CURRENT_USER, layers_key );
+    if (compat_disposition == REG_CREATED_NEW_KEY) RegDeleteKeyA( HKEY_CURRENT_USER, compat_key );
+
+    winetest_pop_context();
+}
+
+static void test_manifest_dpi_child( int arg )
+{
+    DPI_AWARENESS_CONTEXT expect_ctx = LongToHandle( arg ), ctx;
+    WCHAR buffer[16];
+    BOOL loaded;
+
+    winetest_push_context( "%d", arg );
+
+    /* Windows may ignore the external manifest, check whether its gdiScaling setting was loaded */
+    loaded = QueryActCtxSettingsW( 0, NULL, L"http://schemas.microsoft.com/SMI/2017/WindowsSettings",
+                                   L"gdiScaling", buffer, ARRAY_SIZE(buffer), NULL );
+    ctx = pGetThreadDpiAwarenessContext();
+    ok( pAreDpiAwarenessContextsEqual( ctx, expect_ctx ) ||
+        broken( !loaded && pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_UNAWARE ) ),
+        "got %p\n", ctx );
+
+    winetest_pop_context();
+}
+
+static void test_manifest_default_dpi_child(void)
+{
+    DPI_AWARENESS_CONTEXT ctx, old_ctx;
+    WCHAR buffer[16];
+    BOOL loaded, ret;
+
+    loaded = QueryActCtxSettingsW( 0, NULL, L"http://schemas.microsoft.com/SMI/2017/WindowsSettings",
+                                   L"gdiScaling", buffer, ARRAY_SIZE(buffer), NULL );
+    old_ctx = pGetThreadDpiAwarenessContext();
+    ok( pAreDpiAwarenessContextsEqual( old_ctx, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ) ||
+        broken( !loaded && pAreDpiAwarenessContextsEqual( old_ctx, DPI_AWARENESS_CONTEXT_UNAWARE ) ),
+        "got %p\n", old_ctx );
+    if (pGetDpiAwarenessContextForProcess)
+    {
+        ctx = pGetDpiAwarenessContextForProcess( GetCurrentProcess() );
+        ok( pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ) ||
+            broken( !loaded && pAreDpiAwarenessContextsEqual( ctx, DPI_AWARENESS_CONTEXT_UNAWARE ) ),
+            "got process context %p\n", ctx );
+    }
+    else win_skip( "GetDpiAwarenessContextForProcess not supported\n" );
+
+    /* the manifest doesn't set the DPI awareness, so it can still be changed on Wine;
+     * the result on Windows isn't known yet */
+    SetLastError( 0xdeadbeef );
+    ret = pSetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 );
+    trace( "SetProcessDpiAwarenessContext returned %d, error %lu\n", ret, GetLastError() );
+    if (winetest_platform_is_wine) ok( ret, "SetProcessDpiAwarenessContext failed, error %lu\n", GetLastError() );
+    ctx = pGetThreadDpiAwarenessContext();
+    ok( pAreDpiAwarenessContextsEqual( ctx, ret ? DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 : old_ctx ),
+        "got %p\n", ctx );
+}
+
+static void run_with_manifest( char **argv, const char *settings, const char *args )
+{
+    static const char manifest_fmt[] =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+        "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"
+        "  <application xmlns=\"urn:schemas-microsoft-com:asm.v3\"\n"
+        "               xmlns:ws05=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\"\n"
+        "               xmlns:ws16=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\"\n"
+        "               xmlns:ws17=\"http://schemas.microsoft.com/SMI/2017/WindowsSettings\">\n"
+        "    <windowsSettings>%s</windowsSettings>\n"
+        "  </application>\n"
+        "</assembly>\n";
+    static unsigned int index;
+    STARTUPINFOA startup = {.cb = sizeof(STARTUPINFOA)};
+    PROCESS_INFORMATION info = {0};
+    char exe[MAX_PATH], path[MAX_PATH], cmdline[MAX_PATH * 2], manifest[1024];
+    HANDLE file;
+    DWORD size;
+    BOOL ret;
+
+    winetest_push_context( "%s", settings );
+
+    /* Windows caches the manifest lookup, use a new file name for each manifest */
+    GetTempPathA( ARRAY_SIZE(path), path );
+    sprintf( exe, "%sgdi_scaling_%u.exe", path, index++ );
+    GetModuleFileNameA( NULL, path, ARRAY_SIZE(path) );
+    ret = CopyFileA( path, exe, FALSE );
+    ok( ret, "CopyFileA failed, error %lu\n", GetLastError() );
+    if (!ret)
+    {
+        winetest_pop_context();
+        return;
+    }
+
+    sprintf( path, "%s.manifest", exe );
+    file = CreateFileA( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+    ok( file != INVALID_HANDLE_VALUE, "CreateFileA failed, error %lu\n", GetLastError() );
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        sprintf( manifest, manifest_fmt, settings );
+        ret = WriteFile( file, manifest, strlen( manifest ), &size, NULL );
+        ok( ret, "WriteFile failed, error %lu\n", GetLastError() );
+        CloseHandle( file );
+
+        sprintf( cmdline, "\"%s\" %s %s", exe, argv[1], args );
+        ret = CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &info );
+        ok( ret, "CreateProcessA failed, error %lu\n", GetLastError() );
+        if (ret) wait_child_process( &info );
+
+        DeleteFileA( path );
+    }
+    DeleteFileA( exe );
+
+    winetest_pop_context();
+}
+
 static void test_SetThreadDpiAwarenessContext(void)
 {
     DPI_AWARENESS_CONTEXT ctx, old_ctx;
@@ -4514,11 +4700,14 @@ static LRESULT CALLBACK dpi_winproc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
 
 static void test_dpi_window(void)
 {
-    DPI_AWARENESS_CONTEXT context, orig;
+    DPI_AWARENESS_CONTEXT context, context2, orig;
     DPI_AWARENESS awareness;
     ULONG_PTR i, j;
     UINT dpi;
-    HWND hwnd, child, ret;
+    HWND hwnd, child, ret, plain;
+    RECT window_rect, client_rect, rect;
+    int log_x, log_y, x, y;
+    HDC hdc;
     MSG msg = { 0, WM_USER + 1, 0, 0 };
 
     if (!pGetWindowDpiAwarenessContext)
@@ -4635,6 +4824,71 @@ static void test_dpi_window(void)
     dpi = pGetDpiForWindow( GetDesktopWindow() );
     ok( dpi == real_dpi, "got %u / %u\n", dpi, real_dpi );
 
+    /* GDI-scaled windows are DPI unaware windows with a distinct context */
+    if (!pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ))
+    {
+        win_skip( "DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED not supported\n" );
+        pSetThreadDpiAwarenessContext( orig );
+        return;
+    }
+
+    hwnd = CreateWindowExA( 0, "DpiTestClass", "Test", WS_OVERLAPPEDWINDOW,
+                            0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( hwnd != 0, "failed to create window\n" );
+    child = CreateWindowExA( 0, "DpiTestClass", "Test", WS_CHILD,
+                             0, 0, 50, 50, hwnd, 0, GetModuleHandleA(0), NULL );
+    ok( child != 0, "failed to create window\n" );
+
+    context = pGetWindowDpiAwarenessContext( hwnd );
+    ok( pAreDpiAwarenessContextsEqual( context, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ),
+        "wrong context %p\n", context );
+    ok( !pAreDpiAwarenessContextsEqual( context, DPI_AWARENESS_CONTEXT_UNAWARE ),
+        "wrong context %p\n", context );
+    awareness = pGetAwarenessFromDpiAwarenessContext( context );
+    ok( awareness == DPI_AWARENESS_UNAWARE, "wrong awareness %u\n", awareness );
+    context2 = pGetWindowDpiAwarenessContext( child );
+    ok( pAreDpiAwarenessContextsEqual( context2, context ), "wrong child context %p / %p\n", context2, context );
+    dpi = pGetDpiForWindow( hwnd );
+    ok( dpi == USER_DEFAULT_SCREEN_DPI, "got %u\n", dpi );
+    dpi = pGetDpiForWindow( child );
+    ok( dpi == USER_DEFAULT_SCREEN_DPI, "got child %u\n", dpi );
+
+    /* query the GDI-scaled window from its own context, as the application would */
+    GetWindowRect( hwnd, &window_rect );
+    GetClientRect( hwnd, &client_rect );
+    hdc = GetDC( hwnd );
+    log_x = GetDeviceCaps( hdc, LOGPIXELSX );
+    log_y = GetDeviceCaps( hdc, LOGPIXELSY );
+    ReleaseDC( hwnd, hdc );
+    ok( log_x == USER_DEFAULT_SCREEN_DPI, "got LOGPIXELSX %d\n", log_x );
+    ok( log_y == USER_DEFAULT_SCREEN_DPI, "got LOGPIXELSY %d\n", log_y );
+
+    /* compare with an identical plain DPI unaware window */
+    pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE );
+    plain = CreateWindowExA( 0, "DpiTestClass", "Test", WS_OVERLAPPEDWINDOW,
+                             0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( plain != 0, "failed to create window\n" );
+    context2 = pGetWindowDpiAwarenessContext( plain );
+    ok( pAreDpiAwarenessContextsEqual( context2, DPI_AWARENESS_CONTEXT_UNAWARE ),
+        "wrong context %p\n", context2 );
+
+    GetWindowRect( plain, &rect );
+    ok( EqualRect( &window_rect, &rect ), "got window rect %s, expected %s\n",
+        wine_dbgstr_rect(&window_rect), wine_dbgstr_rect(&rect) );
+    GetClientRect( plain, &rect );
+    ok( EqualRect( &client_rect, &rect ), "got client rect %s, expected %s\n",
+        wine_dbgstr_rect(&client_rect), wine_dbgstr_rect(&rect) );
+    hdc = GetDC( plain );
+    x = GetDeviceCaps( hdc, LOGPIXELSX );
+    y = GetDeviceCaps( hdc, LOGPIXELSY );
+    ReleaseDC( plain, hdc );
+    ok( x == USER_DEFAULT_SCREEN_DPI, "got LOGPIXELSX %d\n", x );
+    ok( y == USER_DEFAULT_SCREEN_DPI, "got LOGPIXELSY %d\n", y );
+    ok( log_x == x && log_y == y, "got LOGPIXELS %dx%d, expected %dx%d\n", log_x, log_y, x, y );
+
+    DestroyWindow( plain );
+    DestroyWindow( hwnd );
+
     pSetThreadDpiAwarenessContext( orig );
 }
 
@@ -4716,6 +4970,26 @@ START_TEST(sysparams)
     pGetAutoRotationState = (void*)GetProcAddress(hdll, "GetAutoRotationState");
     pAreDpiAwarenessContextsEqual = (void*)GetProcAddress(hdll, "AreDpiAwarenessContextsEqual");
     pGetDpiFromDpiAwarenessContext = (void*)GetProcAddress(hdll, "GetDpiFromDpiAwarenessContext");
+    pGetDpiAwarenessContextForProcess = (void*)GetProcAddress(hdll, "GetDpiAwarenessContextForProcess");
+
+    argc = winetest_get_mainargs(&argv);
+
+    /* run before get_real_dpi(), which expects the default process DPI awareness */
+    if (argc > 3 && !strcmp( argv[2], "AppCompatLayer" ))
+    {
+        test_app_compat_layer_child( atoi( argv[3] ) );
+        return;
+    }
+    if (argc > 3 && !strcmp( argv[2], "ManifestDpi" ))
+    {
+        test_manifest_dpi_child( atoi( argv[3] ) );
+        return;
+    }
+    if (argc > 2 && !strcmp( argv[2], "ManifestDefaultDpi" ))
+    {
+        test_manifest_default_dpi_child();
+        return;
+    }
 
     hInstance = GetModuleHandleA( NULL );
     hdc = GetDC(0);
@@ -4727,7 +5001,6 @@ START_TEST(sysparams)
     if (!SystemParametersInfoA( SPI_SETBEEP, TRUE, 0, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE ) &&
         GetLastError()==ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION) return;
 
-    argc = winetest_get_mainargs(&argv);
     strict=(argc >= 3 && strcmp(argv[2],"strict")==0);
 
     if (argc > 3 && !strcmp( argv[2], "SetProcessDpiAwarenessContext" ))
@@ -4811,5 +5084,26 @@ START_TEST(sysparams)
         run_in_process( argv, "SetProcessDpiAwarenessContext 0xfffffffd" );
         run_in_process( argv, "SetProcessDpiAwarenessContext 0xfffffffc" );
         run_in_process( argv, "SetProcessDpiAwarenessContext 0xfffffffb" );
+
+        if (!pIsValidDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED ))
+            win_skip( "DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED not supported\n" );
+        else
+        {
+            test_app_compat_layer( argv, "~ GDIDPISCALING DPIUNAWARE", -5 );
+            test_app_compat_layer( argv, "~ HIGHDPIAWARE GDIDPISCALING", -2 );
+
+            run_with_manifest( argv, "<ws05:dpiAware>false</ws05:dpiAware>"
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDpi -5" );
+            run_with_manifest( argv, "<ws16:dpiAwareness>unaware</ws16:dpiAwareness>"
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDpi -5" );
+            run_with_manifest( argv, "<ws05:dpiAware>true</ws05:dpiAware>"
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDpi -2" );
+            run_with_manifest( argv, "<ws16:dpiAwareness>PerMonitorV2</ws16:dpiAwareness>"
+                               "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDpi -4" );
+            run_with_manifest( argv, "<ws17:gdiScaling>true</ws17:gdiScaling>", "ManifestDefaultDpi" );
+        }
+        test_app_compat_layer( argv, "~ DPIUNAWARE", -1 );
+        test_app_compat_layer( argv, "~ HIGHDPIAWARE", -2 );
+        run_with_manifest( argv, "<ws05:dpiAware>false</ws05:dpiAware>", "ManifestDpi -1" );
     }
 }

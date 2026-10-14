@@ -55,6 +55,8 @@ struct cached_font
     LOGFONTW              lf;
     XFORM                 xform;
     UINT                  aa_flags;
+    UINT                  scale;     /* raster scale of the glyphs */
+    BOOL                  linear;    /* grayscale glyphs with linear coverage, see use_linear_coverage */
     struct cached_glyph **glyphs[GLYPH_NBTYPES][GLYPH_CACHE_PAGES];
 };
 
@@ -67,11 +69,12 @@ static BOOL brush_rect( dibdrv_physdev *pdev, dib_brush *brush, const RECT *rect
 {
     DC *dc = get_physdev_dc( &pdev->dev );
     struct clipped_rects clipped_rects;
+    POINT brush_org;
     BOOL ret;
 
     if (!get_clipped_rects( &pdev->dib, rect, clip, &clipped_rects )) return TRUE;
     ret = brush->rects( pdev, brush, &pdev->dib, clipped_rects.count, clipped_rects.rects,
-                        &dc->attr->brush_org, dc->attr->rop_mode );
+                        get_raster_brush_org( dc, &brush_org ), dc->attr->rop_mode );
     free_clipped_rects( &clipped_rects );
     return ret;
 }
@@ -90,6 +93,7 @@ static BOOL pen_region( dibdrv_physdev *pdev, HRGN region )
     return brush_rect( pdev, &pdev->pen_brush, NULL, region );
 }
 
+/* the returned rectangle is in raster coordinates */
 static RECT get_device_rect( DC *dc, int left, int top, int right, int bottom, BOOL rtl_correction )
 {
     RECT rect;
@@ -105,7 +109,7 @@ static RECT get_device_rect( DC *dc, int left, int top, int right, int bottom, B
         rect.left--;
         rect.right--;
     }
-    lp_to_dp( dc, (POINT *)&rect, 2 );
+    lp_to_rp( dc, (POINT *)&rect, 2 );
     order_rect( &rect );
     return rect;
 }
@@ -118,10 +122,13 @@ static BOOL get_pen_device_rect( DC *dc, dibdrv_physdev *dev, RECT *rect,
 
     if (dev->pen_style == PS_INSIDEFRAME)
     {
-        rect->left   += dev->pen_width / 2;
-        rect->top    += dev->pen_width / 2;
-        rect->right  -= (dev->pen_width - 1) / 2;
-        rect->bottom -= (dev->pen_width - 1) / 2;
+        /* the inset is computed in device pixels */
+        int width = dev->pen_device_width, scale = dev->pen_scale;
+
+        rect->left   += scale * (width / 2);
+        rect->top    += scale * (width / 2);
+        rect->right  -= scale * ((width - 1) / 2);
+        rect->bottom -= scale * ((width - 1) / 2);
     }
     return TRUE;
 }
@@ -157,6 +164,7 @@ static void add_pen_lines_bounds( dibdrv_physdev *dev, int count, const POINT *p
             release_wine_region( rgn );
         }
     }
+    else if (dev->pen_scale > 1) width = dev->pen_scale - 1;  /* include the whole device pixel */
 
     while (count-- > 0)
     {
@@ -331,7 +339,7 @@ static BOOL draw_arc( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
     pt[0].y = start_y;
     pt[1].x = end_x;
     pt[1].y = end_y;
-    lp_to_dp( dc, pt, 2 );
+    lp_to_rp( dc, pt, 2 );
     /* make them relative to the ellipse center */
     pt[0].x -= rect.left + width / 2;
     pt[0].y -= rect.top + height / 2;
@@ -344,7 +352,7 @@ static BOOL draw_arc( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
     if (extra_lines == -1)
     {
         points[0] = dc->attr->cur_pos;
-        lp_to_dp( dc, points, 1 );
+        lp_to_rp( dc, points, 1 );
         count = 1 + get_arc_points( dc->attr->arc_direction, &rect, pt[0], pt[1], points + 1 );
     }
     else count = get_arc_points( dc->attr->arc_direction, &rect, pt[0], pt[1], points );
@@ -419,6 +427,17 @@ static BOOL stroke_and_fill_path( dibdrv_physdev *dev, BOOL stroke, BOOL fill )
 
     if (!(path = get_gdi_flat_path( dc, fill ? &interior : NULL ))) return FALSE;
     if (!(total = get_gdi_path_data( path, &points, &types ))) goto done;
+
+    if (dc->gdi_scale > 1)
+    {
+        /* the path is in device coordinates, and the flattened path is our own copy */
+        for (i = 0; i < total; i++)
+        {
+            points[i].x = scale_device_coord( points[i].x, dc->gdi_scale );
+            points[i].y = scale_device_coord( points[i].y, dc->gdi_scale );
+        }
+        if (interior) scale_region( interior, interior, dc->gdi_scale );
+    }
 
     if (stroke && dev->pen_uses_region) outline = NtGdiCreateRectRgn( 0, 0, 0, 0 );
 
@@ -524,6 +543,8 @@ static DWORD font_cache_hash( struct cached_font *font )
     int i;
 
     hash ^= font->aa_flags;
+    hash ^= font->scale;
+    hash ^= font->linear;
     for(i = 0, ptr = (DWORD*)&font->xform; i < sizeof(XFORM)/sizeof(DWORD); i++, ptr++)
         hash ^= *ptr;
     for(i = 0, ptr = (DWORD*)&font->lf; i < 7; i++, ptr++)
@@ -545,13 +566,40 @@ static int font_cache_cmp( const struct cached_font *p1, const struct cached_fon
 {
     int ret = p1->hash - p2->hash;
     if (!ret) ret = p1->aa_flags - p2->aa_flags;
+    if (!ret) ret = p1->scale - p2->scale;
+    if (!ret) ret = p1->linear - p2->linear;
     if (!ret) ret = memcmp( &p1->xform, &p2->xform, sizeof(p1->xform) );
     if (!ret) ret = memcmp( &p1->lf, &p2->lf, FIELD_OFFSET( LOGFONTW, lfFaceName ));
     if (!ret) ret = wcsicmp( p1->lf.lfFaceName, p2->lf.lfFaceName );
     return ret;
 }
 
-static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags )
+/***********************************************************************
+ *         use_linear_coverage
+ *
+ * The raster scaled glyphs of a render font that is hinted the way the host
+ * renders text are also blended the way the host blends grayscale text:
+ * with 256 coverage levels, linearly, instead of the 17 levels of the GDI
+ * ramp. They are cached as 32-bpp glyphs with the coverage in all three
+ * channels, so that draw_subpixel_glyph blends them.
+ */
+static BOOL use_linear_coverage( DC *dc, UINT aa_flags, UINT scale )
+{
+    if (scale <= 1) return FALSE;
+
+    switch (aa_flags)
+    {
+    case GGO_GRAY2_BITMAP:
+    case GGO_GRAY4_BITMAP:
+    case GGO_GRAY8_BITMAP:
+    case WINE_GGO_GRAY16_BITMAP:
+        return dc_has_host_hinted_render_font( dc );
+    default:
+        return FALSE;
+    }
+}
+
+static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags, UINT scale )
 {
     struct cached_font font, *ptr, *last_unused = NULL;
     UINT i = 0, j, k;
@@ -567,6 +615,8 @@ static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags )
     }
     font.lf.lfWidth = abs( font.lf.lfWidth );
     font.aa_flags = aa_flags;
+    font.scale = scale;
+    font.linear = use_linear_coverage( dc, aa_flags, scale );
     font.hash = font_cache_hash( &font );
 
     pthread_mutex_lock( &font_cache_lock );
@@ -710,9 +760,11 @@ static void draw_glyph( dib_info *dib, int x, int y, const GLYPHMETRICS *metrics
     }
 }
 
-static int get_glyph_depth( UINT aa_flags )
+static int get_glyph_depth( const struct cached_font *font )
 {
-    switch (aa_flags)
+    if (font->linear) return 32;
+
+    switch (font->aa_flags)
     {
     case GGO_BITMAP: /* we'll convert non-antialiased 1-bpp bitmaps to 8-bpp */
     case GGO_GRAY2_BITMAP:
@@ -726,7 +778,7 @@ static int get_glyph_depth( UINT aa_flags )
     case WINE_GGO_VBGR_BITMAP: return 32;
 
     default:
-        ERR("Unexpected flags %08x\n", aa_flags);
+        ERR("Unexpected flags %08x\n", font->aa_flags);
         return 0;
     }
 }
@@ -735,16 +787,101 @@ static const BYTE masks[8] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
 static const int padding[4] = {0, 3, 2, 1};
 
 /***********************************************************************
+ *         scale_glyph
+ *
+ * Scale a cached glyph by replicating each of its pixels into a block of
+ * scale x scale pixels, for drawing in raster coordinates.
+ */
+static struct cached_glyph *scale_glyph( const struct cached_glyph *glyph, int bit_count, UINT scale )
+{
+    const GLYPHMETRICS *metrics = &glyph->metrics;
+    UINT width = metrics->gmBlackBoxX, height = metrics->gmBlackBoxY, bpp = bit_count / 8;
+    UINT src_stride, stride, x, y, i;
+    struct cached_glyph *ret;
+    const BYTE *src;
+    BYTE *dst;
+
+    if (width > INT_MAX / 32 / scale || height > INT_MAX / scale ||
+        abs( metrics->gmCellIncX ) > SHRT_MAX / (int)scale ||
+        abs( metrics->gmCellIncY ) > SHRT_MAX / (int)scale)
+        return NULL;
+    src_stride = get_dib_stride( width, bit_count );
+    stride = get_dib_stride( width * scale, bit_count );
+    if (stride && height * scale > (INT_MAX - sizeof(*ret)) / stride) return NULL;
+
+    ret = calloc( 1, FIELD_OFFSET( struct cached_glyph, bits[height * scale * stride] ));
+    if (!ret) return NULL;
+
+    for (y = 0; y < height; y++)
+    {
+        src = glyph->bits + y * src_stride;
+        dst = ret->bits + y * scale * stride;
+        for (x = 0; x < width; x++)
+            for (i = 0; i < scale; i++)
+                memcpy( dst + (x * scale + i) * bpp, src + x * bpp, bpp );
+        for (i = 1; i < scale; i++)
+            memcpy( dst + i * stride, dst, stride );
+    }
+
+    ret->metrics = *metrics;
+    ret->metrics.gmBlackBoxX = width * scale;
+    ret->metrics.gmBlackBoxY = height * scale;
+    ret->metrics.gmptGlyphOrigin.x *= (int)scale;
+    ret->metrics.gmptGlyphOrigin.y *= (int)scale;
+    ret->metrics.gmCellIncX *= (int)scale;
+    ret->metrics.gmCellIncY *= (int)scale;
+    return ret;
+}
+
+/***********************************************************************
+ *         center_scaled_glyph
+ *
+ * Raster scaled glyphs are placed at scale times the advances of the
+ * unscaled glyphs, which are hinted at a different size. Center a scaled
+ * glyph on its scaled advance instead of leaving all the difference on its
+ * right, without moving its ink further out of that cell than it already is.
+ */
+static void center_scaled_glyph( DC *dc, UINT index, UINT ggo_flags, UINT scale, GLYPHMETRICS *metrics )
+{
+    static const MAT2 identity = { {0,1}, {0,0}, {0,0}, {0,1} };
+    int cell, slack, offset, left, right;
+    GLYPHMETRICS gm;
+
+    /* same metrics as the advances that ExtTextOut passes on raster scaled DCs */
+    if (NtGdiGetGlyphOutline( dc->hSelf, index, GGO_METRICS | (ggo_flags & GGO_GLYPH_INDEX), &gm, 0, NULL,
+                              &identity, FALSE ) == GDI_ERROR)
+        return;
+    if (gm.gmCellIncY || metrics->gmCellIncY) return;
+    if (gm.gmCellIncX <= 0 || gm.gmCellIncX > SHRT_MAX / (int)scale) return;
+
+    cell = (int)scale * gm.gmCellIncX;
+    if (metrics->gmBlackBoxX)
+    {
+        slack = cell - metrics->gmCellIncX;
+        offset = slack >= 0 ? (slack + 1) / 2 : -(-slack / 2);
+        left = metrics->gmptGlyphOrigin.x;
+        right = cell - left - (int)metrics->gmBlackBoxX;
+        offset = max( offset, min( 0, -left ));
+        offset = min( offset, max( 0, right ));
+        metrics->gmptGlyphOrigin.x += offset;
+    }
+    metrics->gmCellIncX = cell;
+}
+
+/***********************************************************************
  *         cache_glyph_bitmap
  *
  * Retrieve a 17-level bitmap for the appropriate glyph.
  *
  * For non-antialiased bitmaps convert them to the 17-level format
  * using only values 0 or 16.
+ *
+ * For linear coverage, retrieve a 256-level bitmap and store each level
+ * in the three channels of a 32-bpp pixel.
  */
 static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font, UINT index, UINT flags )
 {
-    UINT ggo_flags = font->aa_flags;
+    UINT ggo_flags = font->linear ? WINE_GGO_GRAY16_BITMAP : font->aa_flags;
     static const MAT2 identity = { {0,1}, {0,0}, {0,0}, {0,1} };
     UINT indices[3] = {0, 0, 0x20};
     int i, x, y;
@@ -752,21 +889,28 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
     BYTE *dst, *src;
     int pad = 0, stride, bit_count;
     GLYPHMETRICS metrics;
-    struct cached_glyph *glyph;
+    struct cached_glyph *glyph, *scaled;
+    /* raster scaled glyphs are rendered by the render font of the DC, if any,
+     * otherwise the unscaled glyphs are replicated */
+    BOOL render = font->scale > 1 && dc_has_render_font( dc );
+    BOOL replicate = font->scale > 1 && !render;
 
     if (flags & ETO_GLYPH_INDEX) ggo_flags |= GGO_GLYPH_INDEX;
     indices[0] = index;
     for (i = 0; i < ARRAY_SIZE( indices ); i++)
     {
         index = indices[i];
-        ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, 0, NULL,
-                                    &identity, FALSE );
+        if (render)
+            ret = get_render_glyph_outline( dc, index, ggo_flags, &metrics, 0, NULL );
+        else
+            ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, 0, NULL,
+                                        &identity, FALSE );
         if (ret != GDI_ERROR) break;
     }
     if (ret == GDI_ERROR) return NULL;
     if (!ret) metrics.gmBlackBoxX = metrics.gmBlackBoxY = 0; /* empty glyph */
 
-    bit_count = get_glyph_depth( font->aa_flags );
+    bit_count = get_glyph_depth( font );
     stride = get_dib_stride( metrics.gmBlackBoxX, bit_count );
     size = metrics.gmBlackBoxY * stride;
     glyph = malloc( FIELD_OFFSET( struct cached_glyph, bits[size] ));
@@ -775,8 +919,11 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
 
     if (bit_count == 8) pad = padding[ metrics.gmBlackBoxX % 4 ];
 
-    ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, size, glyph->bits,
-                                &identity, FALSE );
+    if (render)
+        ret = get_render_glyph_outline( dc, index, ggo_flags, &metrics, size, glyph->bits );
+    else
+        ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, size, glyph->bits,
+                                    &identity, FALSE );
     if (ret == GDI_ERROR)
     {
         free( glyph );
@@ -796,6 +943,17 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
                 dst[x] = (src[x / 8] & masks[x % 8]) ? 0x10 : 0;
         }
     }
+    else if (font->linear)
+    {
+        for (y = metrics.gmBlackBoxY - 1; y >= 0; y--)
+        {
+            src = glyph->bits + y * get_dib_stride( metrics.gmBlackBoxX, 8 );
+            dst = glyph->bits + y * stride;
+
+            for (x = metrics.gmBlackBoxX - 1; x >= 0; x--)
+                ((DWORD *)dst)[x] = src[x] * 0x010101;
+        }
+    }
     else if (pad)
     {
         for (y = 0, dst = glyph->bits; y < metrics.gmBlackBoxY; y++, dst += stride)
@@ -804,6 +962,13 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
 
 done:
     glyph->metrics = metrics;
+    if (replicate)
+    {
+        scaled = scale_glyph( glyph, bit_count, font->scale );
+        free( glyph );
+        if (!(glyph = scaled)) return NULL;
+    }
+    if (font->scale > 1) center_scaled_glyph( dc, index, ggo_flags, font->scale, &glyph->metrics );
     return add_cached_glyph( font, index, flags, glyph );
 }
 
@@ -817,7 +982,7 @@ static void render_string( DC *dc, dib_info *dib, struct cached_font *font, INT 
     DWORD text_color;
     struct font_intensities intensity;
 
-    glyph_dib.bit_count    = get_glyph_depth( font->aa_flags );
+    glyph_dib.bit_count    = get_glyph_depth( font );
     glyph_dib.rect.left    = 0;
     glyph_dib.rect.top     = 0;
     glyph_dib.bits.is_copy = FALSE;
@@ -884,7 +1049,8 @@ BOOL render_aa_text_bitmapinfo( DC *dc, BITMAPINFO *info, struct gdi_image_bits 
         dib.funcs->solid_rects( &dib, 1, &src->visrect, bkgnd_color.and, bkgnd_color.xor );
     }
 
-    if (!(font = add_cached_font( dc, dc->hFont, aa_flags ))) return FALSE;
+    /* the coordinates are those of the bits, which are not raster scaled */
+    if (!(font = add_cached_font( dc, dc->hFont, aa_flags, 1 ))) return FALSE;
 
     render_string( dc, &dib, font, x, y, flags, str, count, dx, &visrect, NULL );
     release_cached_font( font );
@@ -900,9 +1066,31 @@ BOOL dibdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
     dibdrv_physdev *pdev = get_dibdrv_pdev(dev);
     DC *dc = get_physdev_dc( dev );
     struct clipped_rects clipped_rects;
-    RECT bounds;
+    RECT bounds, raster_rect;
+    INT *raster_dx = NULL;
+    UINT i, scale = dc->gdi_scale;
 
     if (!pdev->font) return FALSE;
+
+    if (scale > 1)
+    {
+        /* the coordinates are in device units, draw in raster coordinates */
+        x = scale_device_coord( x, scale );
+        y = scale_device_coord( y, scale );
+        if (rect && (flags & (ETO_OPAQUE | ETO_CLIPPED)))
+        {
+            raster_rect = scale_rect( *rect, scale );
+            rect = &raster_rect;
+        }
+        if (dx && count)
+        {
+            UINT dx_count = (flags & ETO_PDY) ? count * 2 : count;
+
+            if (!(raster_dx = malloc( dx_count * sizeof(*raster_dx) ))) return FALSE;
+            for (i = 0; i < dx_count; i++) raster_dx[i] = scale_device_coord( dx[i], scale );
+            dx = raster_dx;
+        }
+    }
 
     init_clipped_rects( &clipped_rects );
     reset_bounds( &bounds );
@@ -937,6 +1125,7 @@ BOOL dibdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
 done:
     add_clipped_bounds( pdev, &bounds, pdev->clip );
     free_clipped_rects( &clipped_rects );
+    free( raster_dx );
     return TRUE;
 }
 
@@ -956,7 +1145,7 @@ HFONT dibdrv_SelectFont( PHYSDEV dev, HFONT font, UINT *aa_flags )
     if (ret)
     {
         struct cached_font *prev = pdev->font;
-        pdev->font = add_cached_font( dc, font, *aa_flags ? *aa_flags : GGO_BITMAP );
+        pdev->font = add_cached_font( dc, font, *aa_flags ? *aa_flags : GGO_BITMAP, dc->gdi_scale );
         release_cached_font( prev );
     }
     return ret;
@@ -1058,6 +1247,13 @@ BOOL dibdrv_ExtFloodFill( PHYSDEV dev, INT x, INT y, COLORREF color, UINT type )
 
     TRACE( "(%p, %d, %d, %s, %d)\n", pdev, x, y, debugstr_color(color), type );
 
+    if (dc->gdi_scale > 1)
+    {
+        /* start from the raster pixel that GetPixel reads back for this device pixel */
+        x = scale_device_coord( x, dc->gdi_scale ) + (int)dc->gdi_scale - 1;
+        y = scale_device_coord( y, dc->gdi_scale );
+    }
+
     if (x < 0 || x >= pdev->dib.rect.right - pdev->dib.rect.left ||
         y < 0 || y >= pdev->dib.rect.bottom - pdev->dib.rect.top) return FALSE;
 
@@ -1118,7 +1314,7 @@ COLORREF dibdrv_GetPixel( PHYSDEV dev, INT x, INT y )
 
     pt.x = x;
     pt.y = y;
-    lp_to_dp( dc, &pt, 1 );
+    lp_to_rp_pixel( dc, &pt );
     rect.left = pt.x;
     rect.top =  pt.y;
     rect.right = rect.left + 1;
@@ -1144,7 +1340,7 @@ BOOL dibdrv_LineTo( PHYSDEV dev, INT x, INT y )
     pts[1].x = x;
     pts[1].y = y;
 
-    lp_to_dp(dc, pts, 2);
+    lp_to_rp(dc, pts, 2);
 
     if (pdev->pen_uses_region && !(region = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) return FALSE;
 
@@ -1183,6 +1379,7 @@ BOOL dibdrv_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
     int rop2 = get_rop2_from_rop( rop );
     struct clipped_rects clipped_rects;
     DWORD and = 0, xor = 0;
+    POINT brush_org;
     BOOL ret = TRUE;
 
     TRACE("(%p, %d, %d, %d, %d, %06x)\n", dev, dst->x, dst->y, dst->width, dst->height, rop);
@@ -1203,7 +1400,7 @@ BOOL dibdrv_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
         break;
     default:
         ret = brush->rects( pdev, brush, &pdev->dib, clipped_rects.count, clipped_rects.rects,
-                            &dc->attr->brush_org, rop2 );
+                            get_raster_brush_org( dc, &brush_org ), rop2 );
         break;
     }
     free_clipped_rects( &clipped_rects );
@@ -1267,7 +1464,7 @@ BOOL dibdrv_PolyPolygon( PHYSDEV dev, const POINT *pt, const INT *counts, UINT p
         if (!points) return FALSE;
     }
     memcpy( points, pt, total * sizeof(*pt) );
-    lp_to_dp( dc, points, total );
+    lp_to_rp( dc, points, total );
 
     if (pdev->brush.style != BS_NULL &&
         get_dib_rect( &pdev->dib, &rc ) &&
@@ -1338,7 +1535,7 @@ BOOL dibdrv_PolyPolyline( PHYSDEV dev, const POINT* pt, const DWORD* counts, DWO
         if (!points) return FALSE;
     }
     memcpy( points, pt, total * sizeof(*pt) );
-    lp_to_dp( dc, points, total );
+    lp_to_rp( dc, points, total );
 
     if (pdev->pen_uses_region && !(outline = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
     {
@@ -1393,8 +1590,9 @@ BOOL dibdrv_Rectangle( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
 
     if (pdev->pen_uses_region && !(outline = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) return FALSE;
 
-    rect.right--;
-    rect.bottom--;
+    /* move the right and bottom edges to the last device pixel */
+    rect.right  -= dc->gdi_scale;
+    rect.bottom -= dc->gdi_scale;
     reset_dash_origin(pdev);
 
     if (dc->attr->arc_direction == AD_CLOCKWISE)
@@ -1432,10 +1630,13 @@ BOOL dibdrv_Rectangle( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
     }
     else
     {
-        rect.left   += (pdev->pen_width + 1) / 2;
-        rect.top    += (pdev->pen_width + 1) / 2;
-        rect.right  -= pdev->pen_width / 2;
-        rect.bottom -= pdev->pen_width / 2;
+        /* the inset is computed in device pixels */
+        int width = pdev->pen_device_width, scale = pdev->pen_scale;
+
+        rect.left   += scale * ((width + 1) / 2);
+        rect.top    += scale * ((width + 1) / 2);
+        rect.right  -= scale * (width / 2);
+        rect.bottom -= scale * (width / 2);
         ret = brush_rect( pdev, &pdev->brush, &rect, pdev->clip );
     }
     return ret;
@@ -1460,7 +1661,7 @@ BOOL dibdrv_RoundRect( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
     pt[0].x = pt[0].y = 0;
     pt[1].x = ellipse_width;
     pt[1].y = ellipse_height;
-    lp_to_dp( dc, pt, 2 );
+    lp_to_rp( dc, pt, 2 );
     ellipse_width = min( rect.right - rect.left, abs( pt[1].x - pt[0].x ));
     ellipse_height = min( rect.bottom - rect.top, abs( pt[1].y - pt[0].y ));
     if (ellipse_width <= 2|| ellipse_height <= 2)
@@ -1579,11 +1780,11 @@ COLORREF dibdrv_SetPixel( PHYSDEV dev, INT x, INT y, COLORREF color )
 
     pt.x = x;
     pt.y = y;
-    lp_to_dp( dc, &pt, 1 );
+    lp_to_rp( dc, &pt, 1 );
     rect.left = pt.x;
     rect.top =  pt.y;
-    rect.right = rect.left + 1;
-    rect.bottom = rect.top + 1;
+    rect.right = rect.left + dc->gdi_scale;
+    rect.bottom = rect.top + dc->gdi_scale;
     add_clipped_bounds( pdev, &rect, pdev->clip );
 
     /* SetPixel doesn't do the 1bpp massaging like other fg colors */

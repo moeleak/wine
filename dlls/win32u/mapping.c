@@ -280,6 +280,39 @@ void lp_to_dp( DC *dc, POINT *points, INT count )
 
 
 /***********************************************************************
+ *           lp_to_rp
+ *
+ * Map logical coordinates to raster coordinates, i.e. device coordinates
+ * multiplied by the GDI scaling factor of the DC. Only for coordinates
+ * passed to the drivers for rasterization, never for app-visible values.
+ */
+void lp_to_rp( DC *dc, POINT *points, INT count )
+{
+    lp_to_dp( dc, points, count );
+    if (dc->gdi_scale == 1) return;
+    while (count--)
+    {
+        points->x = scale_device_coord( points->x, dc->gdi_scale );
+        points->y = scale_device_coord( points->y, dc->gdi_scale );
+        points++;
+    }
+}
+
+/***********************************************************************
+ *           lp_to_rp_pixel
+ *
+ * Map a logical point to the raster pixel that is read back for its device pixel.
+ * That's the one kept by the nearest neighbor shrink of a blit from raster to device
+ * coordinates: the last column and the first row of the scaled device pixel.
+ */
+void lp_to_rp_pixel( DC *dc, POINT *pt )
+{
+    lp_to_rp( dc, pt, 1 );
+    pt->x += (int)dc->gdi_scale - 1;
+}
+
+
+/***********************************************************************
  *           NtGdiComputeXformCoefficients    (win32u.@)
  */
 BOOL WINAPI NtGdiComputeXformCoefficients( HDC hdc )

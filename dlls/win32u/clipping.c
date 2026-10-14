@@ -65,15 +65,28 @@ static inline RECT get_clip_rect( DC * dc, int left, int top, int right, int bot
 }
 
 /***********************************************************************
+ *           get_dc_raster_device_rect
+ *
+ * Return the DC device rectangle in raster coordinates if not empty.
+ */
+BOOL get_dc_raster_device_rect( DC *dc, RECT *rect )
+{
+    BOOL ret = get_dc_device_rect( dc, rect );
+
+    *rect = scale_rect( *rect, dc->gdi_scale );
+    return ret;
+}
+
+/***********************************************************************
  *           clip_device_rect
  *
- * Clip a rectangle to the whole DC surface.
+ * Clip a rectangle to the whole DC surface. The rectangles are in raster coordinates.
  */
 BOOL clip_device_rect( DC *dc, RECT *dst, const RECT *src )
 {
     RECT clip;
 
-    if (get_dc_device_rect( dc, &clip )) return intersect_rect( dst, src, &clip );
+    if (get_dc_raster_device_rect( dc, &clip )) return intersect_rect( dst, src, &clip );
     *dst = *src;
     return TRUE;
 }
@@ -81,14 +94,14 @@ BOOL clip_device_rect( DC *dc, RECT *dst, const RECT *src )
 /***********************************************************************
  *           clip_visrect
  *
- * Clip a rectangle to the DC visible rect.
+ * Clip a rectangle to the DC visible rect. The rectangles are in raster coordinates.
  */
 BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src )
 {
     RECT clip;
 
     if (!clip_device_rect( dc, dst, src )) return FALSE;
-    if (NtGdiGetRgnBox( get_dc_region(dc), &clip )) return intersect_rect( dst, dst, &clip );
+    if (NtGdiGetRgnBox( get_dc_raster_region(dc), &clip )) return intersect_rect( dst, dst, &clip );
     return TRUE;
 }
 
@@ -100,7 +113,7 @@ BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src )
 void update_dc_clipping( DC * dc )
 {
     PHYSDEV physdev = GET_DC_PHYSDEV( dc, pSetDeviceClipping );
-    HRGN regions[3];
+    HRGN regions[3], rgn;
     int count = 0;
 
     if (dc->hVisRgn)  regions[count++] = dc->hVisRgn;
@@ -118,7 +131,28 @@ void update_dc_clipping( DC * dc )
         if (dc->region) NtGdiDeleteObjectApp( dc->region );
         dc->region = 0;
     }
-    physdev->funcs->pSetDeviceClipping( physdev, get_dc_region( dc ));
+
+    /* the device clipping is in raster coordinates */
+    rgn = get_dc_region( dc );
+    if (dc->gdi_scale > 1 && rgn)
+    {
+        if (!dc->raster_region) dc->raster_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+        /* scaling can only fail on allocation failure, clip everything rather than use a
+         * stale region (emptying doesn't allocate); if the region can't even be created,
+         * the device is left unclipped */
+        if (dc->raster_region && scale_region( dc->raster_region, rgn, dc->gdi_scale ) == ERROR)
+            NtGdiSetRectRgn( dc->raster_region, 0, 0, 0, 0 );
+        physdev->funcs->pSetDeviceClipping( physdev, dc->raster_region );
+    }
+    else
+    {
+        HRGN old = dc->raster_region;
+
+        /* the driver may still reference the old region, delete it only once it has been replaced */
+        dc->raster_region = 0;
+        physdev->funcs->pSetDeviceClipping( physdev, rgn );
+        if (old) NtGdiDeleteObjectApp( old );
+    }
 }
 
 /***********************************************************************

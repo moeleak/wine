@@ -158,6 +158,15 @@ MAKE_FUNCPTR(FcStrSetMember);
 #ifndef FC_PRGNAME
 #define FC_PRGNAME "prgname"
 #endif
+#ifndef FC_VARIABLE
+#define FC_VARIABLE "variable"
+#endif
+#ifndef FC_HINT_STYLE
+#define FC_HINT_STYLE "hintstyle"
+#define FC_HINT_NONE 0
+#define FC_HINT_SLIGHT 1
+#define FC_HINT_FULL 3
+#endif
 #endif /* SONAME_LIBFONTCONFIG */
 
 #undef MAKE_FUNCPTR
@@ -225,7 +234,11 @@ struct font_mapping
 static struct list mappings_list = LIST_INIT( mappings_list );
 
 static UINT default_aa_flags;
+/* how the host hints text by default, for WINE_GGO_HOST_HINTING; full is the GDI way */
+static enum { HOST_HINT_FULL, HOST_HINT_SLIGHT, HOST_HINT_NONE } host_hint_style;
+static BOOL host_autohint;
 static LCID system_lcid;
+static BOOL named_instances_supported; /* expose the named instances of variable fonts as faces */
 
 static BOOL freetype_set_outline_text_metrics( struct gdi_font *font );
 static BOOL freetype_set_bitmap_text_metrics( struct gdi_font *font );
@@ -799,6 +812,8 @@ struct family_names_data
     LANGID primary_langid;
     struct opentype_name family_name;
     struct opentype_name second_name;
+    LANGID family_langid;
+    LANGID second_langid;
     BOOL primary_seen;
     BOOL english_seen;
 };
@@ -812,16 +827,33 @@ static BOOL search_family_names_callback( LANGID langid, struct opentype_name *n
         data->english_seen = TRUE;
         if (data->primary_langid == langid) data->primary_seen = TRUE;
 
-        if (!data->family_name.bytes) data->family_name = *name;
-        else if (data->primary_langid != langid) data->second_name = *name;
+        if (!data->family_name.bytes)
+        {
+            data->family_name = *name;
+            data->family_langid = langid;
+        }
+        else if (data->primary_langid != langid)
+        {
+            data->second_name = *name;
+            data->second_langid = langid;
+        }
     }
     else if (data->primary_langid == langid)
     {
         data->primary_seen = TRUE;
-        if (data->family_name.bytes) data->second_name = data->family_name;
+        if (data->family_name.bytes)
+        {
+            data->second_name = data->family_name;
+            data->second_langid = data->family_langid;
+        }
         data->family_name = *name;
+        data->family_langid = langid;
     }
-    else if (!data->second_name.bytes) data->second_name = *name;
+    else if (!data->second_name.bytes)
+    {
+        data->second_name = *name;
+        data->second_langid = langid;
+    }
 
     if (data->family_name.bytes && data->second_name.bytes && data->primary_seen && data->english_seen)
         return TRUE;
@@ -869,11 +901,176 @@ static WCHAR *decode_opentype_name( struct opentype_name *name )
     return wcsdup( buffer );
 }
 
+/* string of a name ID in the given language, or in English */
+static WCHAR *get_opentype_name( const struct tt_name_v0 *tt_name_v0, USHORT name_id, LANGID langid )
+{
+    struct face_name_data data = {.primary_langid = langid};
+
+    if (!name_id || name_id == 0xffff) return NULL;
+    opentype_enum_names( tt_name_v0, name_id, search_face_name_callback, &data );
+    if (!data.face_name.bytes) return NULL;
+    return decode_opentype_name( &data.face_name );
+}
+
+/* append a space and the first len characters of str to buffer */
+static void append_name( WCHAR *buffer, UINT size, const WCHAR *str, UINT len )
+{
+    UINT pos = lstrlenW( buffer );
+
+    if (!len) return;
+    if (pos && pos < size - 1) buffer[pos++] = ' ';
+    len = min( len, size - 1 - pos );
+    memcpy( buffer + pos, str, len * sizeof(WCHAR) );
+    buffer[pos + len] = 0;
+}
+
+#define STYLE_BOLD   0x1
+#define STYLE_ITALIC 0x2
+
+/* check whether the len characters at word are the word str */
+static BOOL is_word( const WCHAR *word, UINT len, const WCHAR *str )
+{
+    return len == lstrlenW( str ) && !wcsnicmp( word, str, len );
+}
+
+/* Like Windows, fit a named instance into a legacy family of four styles: the words Regular, Bold,
+ * Italic and Oblique of its subfamily name select its style in the family, and every other word is
+ * appended to the family names. Returns the style bits. */
+static UINT split_style_words( const WCHAR *subfamily, WCHAR *family, WCHAR *second, UINT size )
+{
+    static const WCHAR regularW[] = {'R','e','g','u','l','a','r',0};
+    static const WCHAR boldW[] = {'B','o','l','d',0};
+    static const WCHAR italicW[] = {'I','t','a','l','i','c',0};
+    static const WCHAR obliqueW[] = {'O','b','l','i','q','u','e',0};
+    static const WCHAR semiW[] = {'S','e','m','i',0};
+    static const WCHAR demiW[] = {'D','e','m','i',0};
+    static const WCHAR extraW[] = {'E','x','t','r','a',0};
+    static const WCHAR ultraW[] = {'U','l','t','r','a',0};
+    const WCHAR *word = subfamily;
+    BOOL modifier = FALSE;
+    UINT len, style = 0;
+
+    for (;;)
+    {
+        while (*word == ' ') word++;
+        if (!*word) break;
+        len = 0;
+        while (word[len] && word[len] != ' ') len++;
+
+        /* "Semi Bold", "Extra Bold" and the like are weights of their own, not Bold */
+        if (!modifier && is_word( word, len, boldW )) style |= STYLE_BOLD;
+        else if (is_word( word, len, italicW ) || is_word( word, len, obliqueW )) style |= STYLE_ITALIC;
+        else if (!is_word( word, len, regularW ))
+        {
+            append_name( family, size, word, len );
+            if (second[0]) append_name( second, size, word, len );
+        }
+        modifier = is_word( word, len, semiW ) || is_word( word, len, demiW ) ||
+                   is_word( word, len, extraW ) || is_word( word, len, ultraW );
+        word += len;
+    }
+    return style;
+}
+
+/* check whether a name is made only of the words Regular, Bold, Italic and Oblique, and get its style bits */
+static BOOL get_ribbi_style( const WCHAR *name, UINT *style )
+{
+    static const WCHAR regularW[] = {'R','e','g','u','l','a','r',0};
+    static const WCHAR boldW[] = {'B','o','l','d',0};
+    static const WCHAR italicW[] = {'I','t','a','l','i','c',0};
+    static const WCHAR obliqueW[] = {'O','b','l','i','q','u','e',0};
+    const WCHAR *word = name;
+    UINT len;
+
+    *style = 0;
+    for (;;)
+    {
+        while (*word == ' ') word++;
+        if (!*word) break;
+        len = 0;
+        while (word[len] && word[len] != ' ') len++;
+
+        if (is_word( word, len, boldW )) *style |= STYLE_BOLD;
+        else if (is_word( word, len, italicW ) || is_word( word, len, obliqueW )) *style |= STYLE_ITALIC;
+        else if (!is_word( word, len, regularW )) return FALSE;
+        word += len;
+    }
+    return TRUE;
+}
+
+/* Like DirectWrite, fit a named instance into a legacy family of four styles using the STAT axis value
+ * names of the instance: the names made only of the words Regular, Bold, Italic and Oblique select its
+ * style in the family, and the other names are appended to the family names in their languages. The
+ * names are classified by their English strings, fails if one of them has none. */
+static BOOL split_stat_labels( const struct tt_name_v0 *tt_name_v0, const struct opentype_var_instance *instance,
+                               const struct family_names_data *family_names, WCHAR *family, WCHAR *second,
+                               UINT size, UINT *style )
+{
+    WCHAR *english[ARRAY_SIZE(instance->label_name_ids)], *str;
+    UINT i, count, label_style;
+    const WCHAR *name;
+    BOOL ret;
+
+    if (!instance->stat_valid) return FALSE;
+    for (count = 0; count < instance->label_count; count++)
+    {
+        english[count] = get_opentype_name( tt_name_v0, instance->label_name_ids[count],
+                                            MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT) );
+        if (!english[count]) break;
+    }
+
+    if ((ret = count == instance->label_count))
+    {
+        *style = 0;
+        for (i = 0; i < count; i++)
+        {
+            if (get_ribbi_style( english[i], &label_style ))
+            {
+                *style |= label_style;
+                continue;
+            }
+            str = get_opentype_name( tt_name_v0, instance->label_name_ids[i], family_names->family_langid );
+            name = str ? str : english[i];
+            append_name( family, size, name, lstrlenW( name ) );
+            free( str );
+            if (!second[0]) continue;
+            str = get_opentype_name( tt_name_v0, instance->label_name_ids[i], family_names->second_langid );
+            name = str ? str : english[i];
+            append_name( second, size, name, lstrlenW( name ) );
+            free( str );
+        }
+    }
+
+    for (i = 0; i < count; i++) free( english[i] );
+    return ret;
+}
+
+/* check that FreeType loads the named instances of a variable font from bits 16-30 of the face index */
+static BOOL ft_face_has_named_instances( void *data_ptr, UINT data_size, UINT subfont, UINT count )
+{
+    FT_Face ft_face;
+    BOOL ret;
+
+    if (pFT_New_Memory_Face( library, data_ptr, data_size, MAKELONG( subfont, 1 ), &ft_face )) return FALSE;
+    if (!(ret = FT_HAS_MULTIPLE_MASTERS( ft_face )))
+    {
+        WARN( "FreeType has no variable font support, not exposing named instances\n" );
+        named_instances_supported = FALSE;
+    }
+    else ret = HIWORD( ft_face->face_index ) == 1 && (ft_face->style_flags >> 16) >= count;
+    pFT_Done_Face( ft_face );
+    return ret;
+}
+
 struct unix_face
 {
     FT_Face ft_face;
     BOOL scalable;
     UINT num_faces;
+    UINT num_instances;        /* named instances added along with this face, see add_unix_face */
+    UINT default_instance;     /* named instance at the default coordinates, 0 if none */
+    BOOL var_instance;         /* face projected from a named instance of a variable font */
+    BOOL is_default_instance;  /* that named instance is the default instance */
     WCHAR *family_name;
     WCHAR *second_name;
     WCHAR *style_name;
@@ -885,6 +1082,123 @@ struct unix_face
     struct bitmap_font_size size;
 };
 
+static void unix_face_destroy( struct unix_face *This )
+{
+    if (This->ft_face) pFT_Done_Face( This->ft_face );
+    free( This->full_name );
+    free( This->style_name );
+    free( This->second_name );
+    free( This->family_name );
+    free( This );
+}
+
+/* Names, style and weight of a named instance of a variable font, or of its default instance for
+ * index 0. Name IDs 1, 2 and 4 and the OS/2 table only describe the default instance. */
+static BOOL unix_face_set_var_instance( struct unix_face *This, const void *data, size_t size,
+                                        const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                                        const struct tt_name_v0 *tt_name_v0, UINT index )
+{
+    static const WCHAR regularW[] = {'R','e','g','u','l','a','r',0};
+    static const WCHAR boldW[] = {'B','o','l','d',0};
+    static const WCHAR italicW[] = {'I','t','a','l','i','c',0};
+    static const WCHAR bold_italicW[] = {'B','o','l','d',' ','I','t','a','l','i','c',0};
+    static const WCHAR * const style_names[] = {regularW, boldW, italicW, bold_italicW};
+    struct family_names_data family_names = {.primary_langid = system_lcid};
+    WCHAR family[256], second[256], full[LF_FULLFACESIZE], *str, *subfamily;
+    struct opentype_var_instance instance;
+    UINT style, family_len, second_len, max_len;
+    USHORT subfamily_id;
+    BOOL from_stat;
+
+    if (!opentype_get_var_instance( data, size, ttc_sfnt_v1, index, &instance )) return FALSE;
+    if (instance.is_duplicate)
+    {
+        TRACE( "instance %u duplicates an earlier one\n", index );
+        return FALSE;
+    }
+
+    /* the typographic family name, or the family name when there is none */
+    opentype_enum_names( tt_name_v0, TT_NAME_ID_PREFERRED_FAMILY, search_family_names_callback, &family_names );
+    if (!family_names.family_name.bytes)
+    {
+        memset( &family_names, 0, sizeof(family_names) );
+        family_names.primary_langid = system_lcid;
+        opentype_enum_family_names( tt_name_v0, search_family_names_callback, &family_names );
+    }
+    if (!family_names.family_name.bytes || !(str = decode_opentype_name( &family_names.family_name ))) return FALSE;
+    lstrcpynW( family, str, ARRAY_SIZE(family) );
+    free( str );
+    second[0] = 0;
+    if (family_names.second_name.bytes && (str = decode_opentype_name( &family_names.second_name )))
+    {
+        lstrcpynW( second, str, ARRAY_SIZE(second) );
+        free( str );
+    }
+
+    /* the subfamily name of the instance, the typographic subfamily name of the default instance */
+    subfamily_id = index ? instance.subfamily_name_id : TT_NAME_ID_PREFERRED_SUBFAMILY;
+    subfamily = get_opentype_name( tt_name_v0, subfamily_id, family_names.family_langid );
+    if (!subfamily && !index)
+    {
+        subfamily_id = TT_NAME_ID_FONT_SUBFAMILY;
+        subfamily = get_opentype_name( tt_name_v0, subfamily_id, family_names.family_langid );
+    }
+    if (!subfamily) return FALSE;
+
+    lstrcpynW( full, family, ARRAY_SIZE(full) );
+    append_name( full, ARRAY_SIZE(full), subfamily, lstrlenW( subfamily ) );
+
+    family_len = lstrlenW( family );
+    second_len = lstrlenW( second );
+    if (!(from_stat = split_stat_labels( tt_name_v0, &instance, &family_names, family, second,
+                                         ARRAY_SIZE(family), &style )))
+    {
+        WARN( "STAT does not describe instance %u of %s, using its fvar name\n", index, debugstr_w(family) );
+        if ((str = get_opentype_name( tt_name_v0, subfamily_id, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT) )))
+        {
+            style = split_style_words( str, family, second, ARRAY_SIZE(family) );
+            free( str );
+        }
+        else style = split_style_words( subfamily, family, second, ARRAY_SIZE(family) );
+    }
+    free( subfamily );
+
+    /* family names are cut to LF_FACESIZE - 1 characters, one less for the vertical families of DBCS
+     * fonts; keep at least the first letter of the words appended to them, otherwise the instance
+     * would join the family of the Regular instance */
+    max_len = LF_FACESIZE - ((This->fs.fsCsb[0] & FS_DBCS_MASK) ? 4 : 3);
+    if (second_len > max_len && lstrlenW( second ) > second_len) second[0] = 0;
+    if (family_len > max_len && lstrlenW( family ) > family_len)
+    {
+        WARN( "family name %s of instance %u is too long\n", debugstr_w(family), index );
+        return FALSE;
+    }
+
+    /* italic font files often have no ital or slnt axis */
+    if (instance.italic || (!instance.has_slant_axis && (This->ntm_flags & NTM_ITALIC))) style |= STYLE_ITALIC;
+
+    free( This->family_name );
+    free( This->second_name );
+    free( This->style_name );
+    free( This->full_name );
+    This->family_name = wcsdup( family );
+    This->second_name = second[0] ? wcsdup( second ) : NULL;
+    This->style_name = wcsdup( style_names[style] );
+    This->full_name = wcsdup( full );
+    This->ntm_flags &= NTM_PS_OPENTYPE;
+    if (style & STYLE_BOLD) This->ntm_flags |= NTM_BOLD;
+    if (style & STYLE_ITALIC) This->ntm_flags |= NTM_ITALIC;
+    if (!style) This->ntm_flags |= NTM_REGULAR;
+    if (instance.weight) This->weight = instance.weight;
+    This->var_instance = TRUE;
+    This->is_default_instance = instance.is_default;
+
+    TRACE( "instance %u: family %s, second %s, style %s, full %s, weight %u, ntm %#x, named from %s\n",
+           index, debugstr_w(This->family_name), debugstr_w(This->second_name), debugstr_w(This->style_name),
+           debugstr_w(This->full_name), This->weight, This->ntm_flags, from_stat ? "STAT" : "fvar" );
+    return TRUE;
+}
+
 static struct unix_face *unix_face_create( const char *unix_name, void *data_ptr, UINT data_size,
                                            UINT face_index, UINT flags )
 {
@@ -892,6 +1206,7 @@ static struct unix_face *unix_face_create( const char *unix_name, void *data_ptr
 
     const struct ttc_sfnt_v1 *ttc_sfnt_v1;
     const struct tt_name_v0 *tt_name_v0;
+    UINT subfont = face_index, instance = 0;
     struct unix_face *This;
     struct stat st;
     DWORD face_count;
@@ -899,6 +1214,13 @@ static struct unix_face *unix_face_create( const char *unix_name, void *data_ptr
 
     TRACE( "unix_name %s, face_index %u, data_ptr %p, data_size %u, flags %#x\n",
            unix_name, face_index, data_ptr, data_size, flags );
+
+    /* bits 16-30 of the face index select a named instance of a variable font */
+    if (named_instances_supported)
+    {
+        subfont = LOWORD( face_index );
+        instance = HIWORD( face_index );
+    }
 
     if (unix_name)
     {
@@ -916,7 +1238,7 @@ static struct unix_face *unix_face_create( const char *unix_name, void *data_ptr
 
     if (!(This = calloc( 1, sizeof(*This) ))) goto done;
 
-    if (opentype_get_ttc_sfnt_v1( data_ptr, data_size, face_index, &face_count, &ttc_sfnt_v1 ) &&
+    if (opentype_get_ttc_sfnt_v1( data_ptr, data_size, subfont, &face_count, &ttc_sfnt_v1 ) &&
         opentype_get_tt_name_v0( data_ptr, data_size, ttc_sfnt_v1, &tt_name_v0 ) &&
         opentype_get_properties( data_ptr, data_size, ttc_sfnt_v1, &This->font_version,
                                  &This->fs, &This->ntm_flags, &This->weight ))
@@ -960,8 +1282,39 @@ static struct unix_face *unix_face_create( const char *unix_name, void *data_ptr
             lstrcatW( This->full_name, This->style_name );
             WARN( "full name not found, using %s instead\n", debugstr_w(This->full_name) );
         }
+
+        if (named_instances_supported)
+        {
+            struct opentype_var_info info;
+            BOOL valid = TRUE;
+
+            if (!opentype_get_var_info( data_ptr, data_size, ttc_sfnt_v1, &info )) valid = !instance;
+            else if (instance)
+                valid = instance <= info.instance_count &&
+                        unix_face_set_var_instance( This, data_ptr, data_size, ttc_sfnt_v1, tt_name_v0, instance );
+            else if (!ft_face_has_named_instances( data_ptr, data_size, subfont, info.instance_count ))
+                WARN( "FreeType cannot load the named instances of face %u of %s\n", subfont, debugstr_a(unix_name) );
+            else
+            {
+                This->num_instances = info.instance_count;
+                This->default_instance = info.default_instance;
+                /* no named instance is the default instance, name it like one */
+                if (!info.default_instance &&
+                    !unix_face_set_var_instance( This, data_ptr, data_size, ttc_sfnt_v1, tt_name_v0, 0 ))
+                    TRACE( "keeping the names of the default instance of face %u of %s\n",
+                           subfont, debugstr_a(unix_name) );
+            }
+
+            if (!valid)
+            {
+                WARN( "failed to load named instance %u of face %u of %s\n", instance, subfont, debugstr_a(unix_name) );
+                unix_face_destroy( This );
+                This = NULL;
+            }
+        }
     }
-    else if ((This->ft_face = new_ft_face( unix_name, data_ptr, data_size, face_index, flags & ADDFONT_ALLOW_BITMAP )))
+    else if (!instance &&
+             (This->ft_face = new_ft_face( unix_name, data_ptr, data_size, face_index, flags & ADDFONT_ALLOW_BITMAP )))
     {
         TT_OS2 *os2;
 
@@ -1006,21 +1359,13 @@ done:
     return This;
 }
 
-static void unix_face_destroy( struct unix_face *This )
-{
-    if (This->ft_face) pFT_Done_Face( This->ft_face );
-    free( This->full_name );
-    free( This->style_name );
-    free( This->second_name );
-    free( This->family_name );
-    free( This );
-}
-
 static int add_unix_face( const char *unix_name, const WCHAR *file, void *data_ptr, SIZE_T data_size,
                           DWORD face_index, DWORD flags, DWORD *num_faces )
 {
     struct unix_face *unix_face;
-    int ret;
+    BOOL default_added = FALSE;
+    int ret = 0;
+    UINT i;
 
     if (num_faces) *num_faces = 0;
 
@@ -1036,9 +1381,29 @@ static int add_unix_face( const char *unix_name, const WCHAR *file, void *data_p
 
     if (!HIWORD( flags )) flags |= ADDFONT_AA_FLAGS( default_aa_flags );
 
-    ret = add_gdi_face( unix_face->family_name, unix_face->second_name, unix_face->style_name, unix_face->full_name,
-                        file, data_ptr, data_size, face_index, unix_face->fs, unix_face->ntm_flags, unix_face->weight,
-                        unix_face->font_version, flags, unix_face->scalable ? NULL : &unix_face->size );
+    /* like on Windows, every named instance of a variable font is a face of its own; add the default
+     * instance first, so that it wins over the other instances with the same family and style */
+    if (unix_face->default_instance)
+    {
+        ret = add_unix_face( unix_name, file, data_ptr, data_size,
+                             MAKELONG( face_index, unix_face->default_instance ), flags, NULL );
+        default_added = ret > 0;
+    }
+    for (i = 1; i <= unix_face->num_instances; i++)
+    {
+        if (i == unix_face->default_instance) continue;
+        ret += add_unix_face( unix_name, file, data_ptr, data_size, MAKELONG( face_index, i ), flags, NULL );
+    }
+
+    /* the plain face is the default instance, only add it if its named instance was not added;
+     * the named instance at the default coordinates keeps the face index of the plain face */
+    if (!default_added)
+        ret += add_gdi_face( unix_face->family_name, unix_face->second_name, unix_face->style_name,
+                             unix_face->full_name, file, data_ptr, data_size,
+                             unix_face->is_default_instance ? LOWORD( face_index ) : face_index,
+                             unix_face->fs, unix_face->ntm_flags, unix_face->weight, unix_face->font_version,
+                             flags | (unix_face->var_instance ? ADDFONT_VAR_INSTANCE : 0),
+                             unix_face->scalable ? NULL : &unix_face->size );
 
     TRACE("fsCsb = %08x %08x/%08x %08x %08x %08x\n",
           unix_face->fs.fsCsb[0], unix_face->fs.fsCsb[1],
@@ -1169,6 +1534,32 @@ static UINT parse_aa_pattern( FcPattern *pattern )
     return aa_flags;
 }
 
+static void init_host_hinting(void)
+{
+    FcBool hinting = FcTrue, autohint = FcFalse;
+    int style = FC_HINT_FULL;
+    FcPattern *pattern;
+
+    if (!(pattern = pFcPatternCreate())) return;
+    pFcPatternAddString( pattern, FC_PRGNAME, (const FcChar8 *)"wine" );
+    /* same order as FcFontMatch and FcFontRenderPrepare */
+    pFcConfigSubstitute( NULL, pattern, FcMatchPattern );
+    pFcDefaultSubstitute( pattern );
+    pFcConfigSubstitute( NULL, pattern, FcMatchFont );
+    pFcPatternGetBool( pattern, FC_HINTING, 0, &hinting );
+    pFcPatternGetInteger( pattern, FC_HINT_STYLE, 0, &style );
+    pFcPatternGetBool( pattern, FC_AUTOHINT, 0, &autohint );
+    pFcPatternDestroy( pattern );
+
+    /* same mapping as cairo and Qt: medium is hinted like full */
+    host_hint_style = (!hinting || style == FC_HINT_NONE) ? HOST_HINT_NONE :
+                      style == FC_HINT_SLIGHT ? HOST_HINT_SLIGHT : HOST_HINT_FULL;
+    host_autohint = !!autohint;
+
+    TRACE( "hinting %d hintstyle %d autohint %d -> host hint style %u autohint %u\n",
+           hinting, style, autohint, host_hint_style, host_autohint );
+}
+
 static FcPattern *create_family_pattern( const char *name, FcPattern **cached )
 {
     FcPattern *ret = NULL, *tmp, *pattern;
@@ -1192,7 +1583,7 @@ static void fontconfig_add_font( FcPattern *pattern, UINT flags )
 {
     const char *unix_name, *format;
     WCHAR *dos_name;
-    FcBool scalable;
+    FcBool scalable, variable;
     DWORD aa_flags;
     int face_index;
 
@@ -1227,6 +1618,21 @@ static void fontconfig_add_font( FcPattern *pattern, UINT flags )
 
     if (pFcPatternGetInteger( pattern, FC_INDEX, 0, &face_index ) != FcResultMatch)
         face_index = 0;
+
+    /* add_unix_face() adds the named instances of a variable font along with its plain pattern */
+    if (named_instances_supported)
+    {
+        if (HIWORD( face_index ))
+        {
+            TRACE( "ignoring named instance pattern %#x of %s\n", face_index, debugstr_a(unix_name) );
+            return;
+        }
+        if (pFcPatternGetBool( pattern, FC_VARIABLE, 0, &variable ) == FcResultMatch && variable)
+        {
+            TRACE( "ignoring variable font pattern of %s\n", debugstr_a(unix_name) );
+            return;
+        }
+    }
 
     ntdll_get_dos_file_name( unix_name, &dos_name, FILE_OPEN );
     add_unix_face( unix_name, dos_name, NULL, 0, face_index, flags, NULL );
@@ -1286,6 +1692,8 @@ static void init_fontconfig(void)
             default_aa_flags = parse_aa_pattern( pattern );
             pFcPatternDestroy( pattern );
         }
+
+        init_host_hinting();
 
         TRACE( "enabled, default flags = %x\n", default_aa_flags );
         fontconfig_enabled = TRUE;
@@ -1522,6 +1930,11 @@ static BOOL init_freetype(void)
     }
 
     pFT_Library_SetLcdFilter( library, FT_LCD_FILTER_DEFAULT );
+
+    /* FreeType loads a named instance from bits 16-30 of the face index; 2.9 fixed the advance
+     * widths of named instances and 2.10 applies the metrics variations of MVAR */
+    named_instances_supported = FT_SimpleVersion >= FT_VERSION_VALUE(2, 10, 0);
+    TRACE( "named instances of variable fonts %s\n", named_instances_supported ? "supported" : "not supported" );
 
     return TRUE;
 
@@ -2080,7 +2493,14 @@ static BOOL freetype_load_font( struct gdi_font *font )
         data_size = font->data_size;
     }
 
-    if (pFT_New_Memory_Face( library, data_ptr, data_size, font->face_index, &ft_face )) return FALSE;
+    if (pFT_New_Memory_Face( library, data_ptr, data_size, font->face_index, &ft_face ))
+    {
+        if (!HIWORD( font->face_index ) ||
+            pFT_New_Memory_Face( library, data_ptr, data_size, LOWORD( font->face_index ), &ft_face ))
+            return FALSE;
+        WARN( "failed to load named instance %#x of %s, using the default instance\n",
+              font->face_index, debugstr_w(font->file) );
+    }
 
     data->ft_face = ft_face;
     font->scalable = FT_IS_SCALABLE( ft_face );
@@ -2101,7 +2521,8 @@ static BOOL freetype_load_font( struct gdi_font *font )
         if (font->ppem == 0) font->ppem = calc_ppem_for_height( ft_face, font->lf.lfHeight );
         TRACE( "height %d => ppem %d\n", font->lf.lfHeight, font->ppem );
         height = font->ppem;
-        font->ttc_item_offset = get_ttc_offset( ft_face, font->face_index );
+        /* bits 16-30 of face_index select a named instance of a variable font */
+        font->ttc_item_offset = get_ttc_offset( ft_face, LOWORD( font->face_index ) );
         font->otm.otmEMSquare = ft_face->units_per_EM;
     }
     else
@@ -3062,33 +3483,42 @@ static unsigned int get_bezier_glyph_outline(FT_Outline *outline, unsigned int b
 
 static FT_Int get_load_flags( UINT format )
 {
-    FT_Int load_flags = FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH;
+    FT_Int load_flags = FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH, target;
 
     if (format & GGO_UNHINTED)
         return load_flags | FT_LOAD_NO_HINTING;
 
-    switch (format & ~GGO_GLYPH_INDEX)
+    switch (format & ~(GGO_GLYPH_INDEX | WINE_GGO_HOST_HINTING))
     {
     case GGO_BITMAP:
-        load_flags |= FT_LOAD_TARGET_MONO;
-        break;
+        /* monochrome is always hinted the GDI way */
+        return load_flags | FT_LOAD_TARGET_MONO;
     case GGO_GRAY2_BITMAP:
     case GGO_GRAY4_BITMAP:
     case GGO_GRAY8_BITMAP:
     case WINE_GGO_GRAY16_BITMAP:
-        load_flags |= FT_LOAD_TARGET_NORMAL;
+        target = FT_LOAD_TARGET_NORMAL;
         break;
     case WINE_GGO_HRGB_BITMAP:
     case WINE_GGO_HBGR_BITMAP:
-        load_flags |= FT_LOAD_TARGET_LCD;
+        target = FT_LOAD_TARGET_LCD;
         break;
     case WINE_GGO_VRGB_BITMAP:
     case WINE_GGO_VBGR_BITMAP:
-        load_flags |= FT_LOAD_TARGET_LCD_V;
+        target = FT_LOAD_TARGET_LCD_V;
         break;
+    default:  /* GGO_METRICS, GGO_NATIVE, GGO_BEZIER */
+        return load_flags;
     }
 
-    return load_flags;
+    if (format & WINE_GGO_HOST_HINTING)
+    {
+        if (host_hint_style == HOST_HINT_NONE) return load_flags | FT_LOAD_NO_HINTING;
+        if (host_hint_style == HOST_HINT_SLIGHT) target = FT_LOAD_TARGET_LIGHT;
+        if (host_autohint) load_flags |= FT_LOAD_FORCE_AUTOHINT;
+    }
+
+    return load_flags | target;
 }
 
 /*************************************************************
@@ -3113,7 +3543,7 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
           font->matrix.eM11, font->matrix.eM12,
           font->matrix.eM21, font->matrix.eM22);
 
-    format &= ~GGO_UNHINTED;
+    format &= ~(GGO_UNHINTED | WINE_GGO_HOST_HINTING);
 
     matrices = get_transform_matrices( font, tategaki, lpmat, transform_matrices );
 
@@ -3412,7 +3842,10 @@ static BOOL freetype_set_outline_text_metrics( struct gdi_font *font )
         TM.tmAveCharWidth = 1; 
     }
     TM.tmMaxCharWidth = SCALE_X(ft_face->bbox.xMax - ft_face->bbox.xMin);
-    TM.tmWeight = font->fake_bold ? FW_BOLD : pOS2->usWeightClass;
+    /* the OS/2 table of a variable font describes its default instance only */
+    if (font->fake_bold) TM.tmWeight = FW_BOLD;
+    else if (font->var_instance) TM.tmWeight = font->weight;
+    else TM.tmWeight = pOS2->usWeightClass;
 
     TM.tmOverhang = 0;
     TM.tmDigitizedAspectX = 96; /* FIXME */
@@ -3453,7 +3886,9 @@ static BOOL freetype_set_outline_text_metrics( struct gdi_font *font )
             TM.tmBreakChar = pOS2->usFirstCharIndex;
         TM.tmDefaultChar = TM.tmBreakChar - 1;
     }
-    TM.tmItalic = font->fake_italic ? 255 : ((ft_face->style_flags & FT_STYLE_FLAG_ITALIC) ? 255 : 0);
+    if (font->fake_italic) TM.tmItalic = 255;
+    else if (font->var_instance) TM.tmItalic = (font->ntmFlags & NTM_ITALIC) ? 255 : 0;
+    else TM.tmItalic = (ft_face->style_flags & FT_STYLE_FLAG_ITALIC) ? 255 : 0;
     TM.tmUnderlined = font->lf.lfUnderline ? 255 : 0;
     TM.tmStruckOut = font->lf.lfStrikeOut ? 255 : 0;
 
@@ -3534,6 +3969,14 @@ static BOOL freetype_set_outline_text_metrics( struct gdi_font *font )
     font->otm.otmFiller = 0;
     memcpy(&font->otm.otmPanoseNumber, pOS2->panose, PANOSE_COUNT);
     font->otm.otmfsSelection = pOS2->fsSelection;
+    if (font->var_instance)
+    {
+        /* replace the ITALIC, BOLD and REGULAR bits of the default instance */
+        font->otm.otmfsSelection &= ~((1 << 0) | (1 << 5) | (1 << 6));
+        if (font->ntmFlags & NTM_ITALIC) font->otm.otmfsSelection |= 1 << 0;
+        if (font->ntmFlags & NTM_BOLD) font->otm.otmfsSelection |= 1 << 5;
+        if (font->ntmFlags & NTM_REGULAR) font->otm.otmfsSelection |= 1 << 6;
+    }
     if (font->fake_italic)
         font->otm.otmfsSelection |= 1;
     if (font->fake_bold)

@@ -43,6 +43,20 @@ WINE_DEFAULT_DEBUG_CHANNEL(font);
 #define MS_CBDT_TAG MS_MAKE_TAG('C','B','D','T')
 #define MS_NAME_TAG MS_MAKE_TAG('n','a','m','e')
 #define MS_CFF__TAG MS_MAKE_TAG('C','F','F',' ')
+#define MS_CFF2_TAG MS_MAKE_TAG('C','F','F','2')
+#define MS_FVAR_TAG MS_MAKE_TAG('f','v','a','r')
+#define MS_GLYF_TAG MS_MAKE_TAG('g','l','y','f')
+#define MS_GVAR_TAG MS_MAKE_TAG('g','v','a','r')
+#define MS_STAT_TAG MS_MAKE_TAG('S','T','A','T')
+#define MS_WGHT_TAG MS_MAKE_TAG('w','g','h','t')
+#define MS_ITAL_TAG MS_MAKE_TAG('i','t','a','l')
+#define MS_SLNT_TAG MS_MAKE_TAG('s','l','n','t')
+
+/* limits on the variable fonts whose named instances are exposed, and on the STAT tables naming them */
+#define MAX_VAR_AXES      64
+#define MAX_VAR_INSTANCES 256
+#define MAX_STAT_AXES     32
+#define MAX_STAT_VALUES   1024
 
 #ifdef WORDS_BIGENDIAN
 #define GET_BE_WORD(x) (x)
@@ -158,7 +172,74 @@ struct tt_head
     SHORT index_format;
     SHORT glyphdata_format;
 };
+
+struct tt_fvar_header
+{
+    DWORD version;
+    WORD axesArrayOffset;
+    WORD reserved;
+    WORD axisCount;
+    WORD axisSize;
+    WORD instanceCount;
+    WORD instanceSize;
+};
+
+struct tt_fvar_axis
+{
+    DWORD axisTag;
+    DWORD minValue;
+    DWORD defaultValue;
+    DWORD maxValue;
+    WORD flags;
+    WORD axisNameID;
+};
+
+struct tt_fvar_instance
+{
+    WORD subfamilyNameID;
+    WORD flags;
+    DWORD coordinates[1];
+    /* WORD postScriptNameID; optional */
+};
+
+struct tt_stat_header
+{
+    WORD majorVersion;
+    WORD minorVersion;
+    WORD designAxisSize;
+    WORD designAxisCount;
+    DWORD designAxesOffset;
+    WORD axisValueCount;
+    DWORD offsetToAxisValueOffsets;
+};
+
+struct tt_stat_axis
+{
+    DWORD axisTag;
+    WORD axisNameID;
+    WORD axisOrdering;
+};
+
+struct tt_stat_axis_value
+{
+    WORD format;
+    WORD axisIndex;      /* axisCount in format 4 */
+    WORD flags;
+    WORD valueNameID;
+    DWORD value;         /* nominalValue in format 2, the first axis value record in format 4 */
+    DWORD rangeMinValue; /* linkedValue in format 3 */
+    DWORD rangeMaxValue;
+};
+
+struct tt_stat_axis_value_record
+{
+    WORD axisIndex;
+    DWORD value;
+};
 #pragma pack(pop)
+
+#define STAT_OLDER_SIBLING_FONT_ATTRIBUTE 0x0001
+#define STAT_ELIDABLE_AXIS_VALUE_NAME     0x0002
 
 enum OPENTYPE_PLATFORM_ID
 {
@@ -279,17 +360,20 @@ static BOOL opentype_get_table_ptr( const void *data, size_t size, const struct 
     const struct tt_tablerecord *table_record;
     UINT16 i, table_count;
     UINT32 offset, length;
+    size_t records_offset;
 
     if (!ttc_sfnt_v1) return FALSE;
 
     table_record = (const struct tt_tablerecord *)(ttc_sfnt_v1 + 1);
     table_count = GET_BE_WORD( ttc_sfnt_v1->numTables );
+    records_offset = (const char *)table_record - (const char *)data;
+    if (table_count > (size - records_offset) / sizeof(*table_record)) return FALSE;
     for (i = 0; i < table_count; i++, table_record++)
     {
         if (table_record->tag != table_tag) continue;
         offset = GET_BE_DWORD( table_record->offset );
         length = GET_BE_DWORD( table_record->length );
-        if (size < offset + length) return FALSE;
+        if (offset > size || length > size - offset) return FALSE;
         if (table_size && length < *table_size) return FALSE;
 
         if (table_ptr) *table_ptr = (const char *)data + offset;
@@ -565,7 +649,7 @@ static LANGID get_name_record_langid( enum OPENTYPE_PLATFORM_ID platform, USHORT
 }
 
 static BOOL opentype_enum_font_names( const struct tt_name_v0 *header, enum OPENTYPE_PLATFORM_ID platform,
-                                      enum OPENTYPE_NAME_ID name, opentype_enum_names_cb callback, void *user )
+                                      USHORT name, opentype_enum_names_cb callback, void *user )
 {
     const char *name_data;
     USHORT i, name_count, encoding, language, length, offset;
@@ -633,8 +717,9 @@ BOOL opentype_get_ttc_sfnt_v1( const void *data, size_t size, DWORD index, DWORD
         WARN( "unsupported font format %x\n", fourcc );
         return FALSE;
     case MS_TTCF_TAG:
-        if (size < sizeof(ttc_header_v1)) return FALSE;
+        if (size < offsetof( struct ttc_header_v1, OffsetTable )) return FALSE;
         if (index >= (*count = GET_BE_DWORD( ttc_header_v1->numFonts ))) return FALSE;
+        if (index >= (size - offsetof( struct ttc_header_v1, OffsetTable )) / sizeof(DWORD)) return FALSE;
         offset = GET_BE_DWORD( ttc_header_v1->OffsetTable[index] );
         break;
     case 0x00000100:
@@ -643,7 +728,7 @@ BOOL opentype_get_ttc_sfnt_v1( const void *data, size_t size, DWORD index, DWORD
         break;
     }
 
-    if (size < offset + sizeof(**ttc_sfnt_v1)) return FALSE;
+    if (offset > size || size - offset < sizeof(**ttc_sfnt_v1)) return FALSE;
     *ttc_sfnt_v1 = (const struct ttc_sfnt_v1 *)((const char *)data + offset);
 
     if (!opentype_get_table_ptr( data, size, *ttc_sfnt_v1, MS_HEAD_TAG, NULL, NULL ))
@@ -690,37 +775,30 @@ BOOL opentype_get_tt_name_v0( const void *data, size_t size, const struct ttc_sf
     return opentype_get_table_ptr( data, size, ttc_sfnt_v1, MS_NAME_TAG, (const void **)tt_name_v0, &table_size );
 }
 
-BOOL opentype_enum_family_names( const struct tt_name_v0 *header, opentype_enum_names_cb callback, void *user )
+BOOL opentype_enum_names( const struct tt_name_v0 *header, USHORT name_id, opentype_enum_names_cb callback, void *user )
 {
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_WIN, OPENTYPE_NAME_FAMILY, callback, user ))
+    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_WIN, name_id, callback, user ))
         return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_MAC, OPENTYPE_NAME_FAMILY, callback, user ))
+    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_MAC, name_id, callback, user ))
         return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_UNICODE, OPENTYPE_NAME_FAMILY, callback, user ))
+    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_UNICODE, name_id, callback, user ))
         return TRUE;
     return FALSE;
+}
+
+BOOL opentype_enum_family_names( const struct tt_name_v0 *header, opentype_enum_names_cb callback, void *user )
+{
+    return opentype_enum_names( header, OPENTYPE_NAME_FAMILY, callback, user );
 }
 
 BOOL opentype_enum_style_names( const struct tt_name_v0 *header, opentype_enum_names_cb callback, void *user )
 {
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_WIN, OPENTYPE_NAME_SUBFAMILY, callback, user ))
-        return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_MAC, OPENTYPE_NAME_SUBFAMILY, callback, user ))
-        return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_UNICODE, OPENTYPE_NAME_SUBFAMILY, callback, user ))
-        return TRUE;
-    return FALSE;
+    return opentype_enum_names( header, OPENTYPE_NAME_SUBFAMILY, callback, user );
 }
 
 BOOL opentype_enum_full_names( const struct tt_name_v0 *header, opentype_enum_names_cb callback, void *user )
 {
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_WIN, OPENTYPE_NAME_FULLNAME, callback, user ))
-        return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_MAC, OPENTYPE_NAME_FULLNAME, callback, user ))
-        return TRUE;
-    if (opentype_enum_font_names( header, OPENTYPE_PLATFORM_UNICODE, OPENTYPE_NAME_FULLNAME, callback, user ))
-        return TRUE;
-    return FALSE;
+    return opentype_enum_names( header, OPENTYPE_NAME_FULLNAME, callback, user );
 }
 
 BOOL opentype_get_properties( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
@@ -768,5 +846,347 @@ BOOL opentype_get_properties( const void *data, size_t size, const struct ttc_sf
         flags |= NTM_PS_OPENTYPE;
 
     *ntm_flags = flags;
+    return TRUE;
+}
+
+/* like FreeType, treat zero-length tables as missing */
+static BOOL opentype_has_table( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1, UINT32 tag )
+{
+    UINT32 table_size = 1;
+    return opentype_get_table_ptr( data, size, ttc_sfnt_v1, tag, NULL, &table_size );
+}
+
+struct opentype_var_font
+{
+    const struct tt_fvar_axis *axes;
+    const BYTE *instances;
+    UINT axis_count;
+    UINT instance_size;
+    UINT record_count;    /* number of named instance records in fvar */
+    UINT instance_count;  /* number of exposed named instances, the first records */
+    const struct tt_stat_header *stat;
+    UINT32 stat_size;
+};
+
+static BOOL opentype_get_var_font( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                                   struct opentype_var_font *var )
+{
+    UINT32 fvar_size = sizeof(struct tt_fvar_header), stat_size = sizeof(struct tt_stat_header);
+    const struct tt_fvar_header *fvar;
+    const struct tt_stat_header *stat;
+    UINT axes_offset, design_axis_count, axis_value_count;
+
+    if (!opentype_get_table_ptr( data, size, ttc_sfnt_v1, MS_FVAR_TAG, (const void **)&fvar, &fvar_size ))
+        return FALSE;
+
+    /* use the same checks as FreeType, so that it accepts every named instance we expose */
+    axes_offset = GET_BE_WORD( fvar->axesArrayOffset );
+    var->axis_count = GET_BE_WORD( fvar->axisCount );
+    var->instance_size = GET_BE_WORD( fvar->instanceSize );
+    var->record_count = GET_BE_WORD( fvar->instanceCount );
+    if (GET_BE_DWORD( fvar->version ) != 0x00010000 ||
+        GET_BE_WORD( fvar->axisSize ) != sizeof(struct tt_fvar_axis) ||
+        !var->axis_count || var->axis_count > 0x3ffe ||
+        (var->instance_size != 4 + 4 * var->axis_count && var->instance_size != 6 + 4 * var->axis_count) ||
+        var->record_count > 0x7eff ||
+        axes_offset + (UINT64)sizeof(struct tt_fvar_axis) * var->axis_count +
+        (UINT64)var->instance_size * var->record_count > fvar_size)
+    {
+        WARN( "invalid fvar table\n" );
+        return FALSE;
+    }
+    if (!var->record_count)
+    {
+        TRACE( "no named instances\n" );
+        return FALSE;
+    }
+
+    /* FreeType has no named instances for Multiple Master CFF fonts, and before 2.13
+     * it ignores the fvar table of TrueType fonts that have no gvar table */
+    if (!(opentype_has_table( data, size, ttc_sfnt_v1, MS_GLYF_TAG ) &&
+          opentype_has_table( data, size, ttc_sfnt_v1, MS_GVAR_TAG )) &&
+        !opentype_has_table( data, size, ttc_sfnt_v1, MS_CFF2_TAG ))
+    {
+        TRACE( "no glyf and gvar tables, or CFF2 table\n" );
+        return FALSE;
+    }
+
+    if (var->axis_count > MAX_VAR_AXES)
+    {
+        WARN( "ignoring the named instances of a font with %u axes\n", var->axis_count );
+        return FALSE;
+    }
+
+    /* like DirectWrite, only expose the named instances of fonts with a usable STAT table */
+    if (!opentype_get_table_ptr( data, size, ttc_sfnt_v1, MS_STAT_TAG, (const void **)&stat, &stat_size ))
+    {
+        TRACE( "no STAT table\n" );
+        return FALSE;
+    }
+    design_axis_count = GET_BE_WORD( stat->designAxisCount );
+    axis_value_count = GET_BE_WORD( stat->axisValueCount );
+    if (GET_BE_WORD( stat->majorVersion ) != 1 ||
+        GET_BE_WORD( stat->designAxisSize ) < sizeof(struct tt_stat_axis) ||
+        !design_axis_count || !axis_value_count ||
+        GET_BE_DWORD( stat->designAxesOffset ) +
+        (UINT64)GET_BE_WORD( stat->designAxisSize ) * design_axis_count > stat_size ||
+        GET_BE_DWORD( stat->offsetToAxisValueOffsets ) + (UINT64)sizeof(WORD) * axis_value_count > stat_size)
+    {
+        TRACE( "unusable STAT table\n" );
+        return FALSE;
+    }
+
+    var->axes = (const struct tt_fvar_axis *)((const BYTE *)fvar + axes_offset);
+    var->instances = (const BYTE *)(var->axes + var->axis_count);
+    var->instance_count = min( var->record_count, MAX_VAR_INSTANCES );
+    var->stat = stat;
+    var->stat_size = stat_size;
+    return TRUE;
+}
+
+/* index is the 1-based record index, as in bits 16-30 of FreeType face indices */
+static const struct tt_fvar_instance *var_get_instance( const struct opentype_var_font *var, UINT index )
+{
+    return (const struct tt_fvar_instance *)(var->instances + (index - 1) * var->instance_size);
+}
+
+/* 16.16 user space coordinate of a named instance, or of the default instance for index 0 */
+static INT32 var_get_coord( const struct opentype_var_font *var, UINT index, UINT axis )
+{
+    if (!index) return GET_BE_DWORD( var->axes[axis].defaultValue );
+    return GET_BE_DWORD( var_get_instance( var, index )->coordinates[axis] );
+}
+
+static BOOL var_coords_equal( const struct opentype_var_font *var, UINT index, UINT other )
+{
+    UINT i;
+
+    for (i = 0; i < var->axis_count; i++)
+        if (var_get_coord( var, index, i ) != var_get_coord( var, other, i )) return FALSE;
+    return TRUE;
+}
+
+static const struct tt_stat_axis *stat_get_design_axis( const struct opentype_var_font *var, UINT axis )
+{
+    const BYTE *axes = (const BYTE *)var->stat + GET_BE_DWORD( var->stat->designAxesOffset );
+    return (const struct tt_stat_axis *)(axes + axis * GET_BE_WORD( var->stat->designAxisSize ));
+}
+
+static UINT stat_axis_ordering( const struct opentype_var_font *var, UINT axis )
+{
+    return GET_BE_WORD( stat_get_design_axis( var, axis )->axisOrdering );
+}
+
+/* the axis value table k of STAT, NULL if it is invalid or only meant for older fonts of the family */
+static const struct tt_stat_axis_value *stat_get_axis_value( const struct opentype_var_font *var, UINT k )
+{
+    UINT32 offsets = GET_BE_DWORD( var->stat->offsetToAxisValueOffsets );
+    const WORD *offset_array = (const WORD *)((const BYTE *)var->stat + offsets);
+    UINT64 offset = (UINT64)offsets + GET_BE_WORD( offset_array[k] );
+    const struct tt_stat_axis_value *value;
+    UINT value_size;
+
+    if (offset + offsetof( struct tt_stat_axis_value, value ) > var->stat_size) return NULL;
+    value = (const struct tt_stat_axis_value *)((const BYTE *)var->stat + offset);
+    switch (GET_BE_WORD( value->format ))
+    {
+    case 1: value_size = offsetof( struct tt_stat_axis_value, rangeMinValue ); break;
+    case 2: value_size = sizeof(struct tt_stat_axis_value); break;
+    case 3: value_size = offsetof( struct tt_stat_axis_value, rangeMaxValue ); break;
+    case 4:
+        value_size = offsetof( struct tt_stat_axis_value, value ) +
+                     GET_BE_WORD( value->axisIndex ) * sizeof(struct tt_stat_axis_value_record);
+        break;
+    default: return NULL;
+    }
+    if (offset + value_size > var->stat_size) return NULL;
+    if (GET_BE_WORD( value->flags ) & STAT_OLDER_SIBLING_FONT_ATTRIBUTE) return NULL;
+    return value;
+}
+
+struct stat_label
+{
+    UINT ordering;
+    WORD name_id;
+    WORD flags;
+};
+
+/* insert the name of an axis value into the labels sorted by axis ordering */
+static BOOL stat_add_label( struct stat_label *labels, UINT *count, UINT ordering,
+                            const struct tt_stat_axis_value *value )
+{
+    UINT i;
+
+    if (*count == MAX_STAT_AXES) return FALSE;
+    for (i = *count; i > 0 && labels[i - 1].ordering > ordering; i--) labels[i] = labels[i - 1];
+    labels[i].ordering = ordering;
+    labels[i].name_id = GET_BE_WORD( value->valueNameID );
+    labels[i].flags = GET_BE_WORD( value->flags );
+    (*count)++;
+    return TRUE;
+}
+
+/* Like DirectWrite, name a named instance, or the default instance for index 0, with the STAT axis
+ * values of its coordinates in axis ordering, leaving out the elidable ones. Fails if a variation axis
+ * has no design axis, or if its value has no name. */
+static BOOL stat_get_instance_labels( const struct opentype_var_font *var, UINT index,
+                                      struct opentype_var_instance *instance )
+{
+    UINT design_count = GET_BE_WORD( var->stat->designAxisCount );
+    UINT value_count = GET_BE_WORD( var->stat->axisValueCount );
+    const struct tt_stat_axis_value_record *record;
+    const struct tt_stat_axis_value *value;
+    struct stat_label labels[MAX_STAT_AXES];
+    BOOL covered[MAX_STAT_AXES] = {0}, described[MAX_VAR_AXES] = {0};
+    int fvar_axis[MAX_STAT_AXES];
+    UINT i, j, k, count, label_count = 0;
+
+    if (design_count > MAX_STAT_AXES || value_count > MAX_STAT_VALUES)
+    {
+        TRACE( "ignoring STAT table with %u design axes and %u axis values\n", design_count, value_count );
+        return FALSE;
+    }
+
+    for (i = 0; i < design_count; i++)
+    {
+        DWORD tag = stat_get_design_axis( var, i )->axisTag;
+
+        fvar_axis[i] = -1;
+        for (j = 0; j < var->axis_count && fvar_axis[i] < 0; j++)
+            if (var->axes[j].axisTag == tag) fvar_axis[i] = j;
+        if (fvar_axis[i] >= 0) described[fvar_axis[i]] = TRUE;
+    }
+
+    /* instances that differ only on an axis STAT doesn't describe would get the same names */
+    for (j = 0; j < var->axis_count; j++)
+    {
+        if (described[j]) continue;
+        TRACE( "no STAT design axis for %s\n", debugstr_fourcc( var->axes[j].axisTag ) );
+        return FALSE;
+    }
+
+    /* format 4 values name a combination of axis values, and take precedence */
+    for (k = 0; k < value_count; k++)
+    {
+        UINT ordering = ~0u;
+        BOOL match = TRUE;
+
+        if (!(value = stat_get_axis_value( var, k )) || GET_BE_WORD( value->format ) != 4) continue;
+        /* there is at most one record for each design axis */
+        if (!(count = GET_BE_WORD( value->axisIndex )) || count > design_count) continue;
+        record = (const struct tt_stat_axis_value_record *)&value->value;
+        for (j = 0; j < count && match; j++)
+        {
+            UINT axis = GET_BE_WORD( record[j].axisIndex );
+
+            if (axis >= design_count || fvar_axis[axis] < 0 || covered[axis] ||
+                var_get_coord( var, index, fvar_axis[axis] ) != (INT32)GET_BE_DWORD( record[j].value ))
+                match = FALSE;
+            else ordering = min( ordering, stat_axis_ordering( var, axis ) );
+        }
+        if (!match) continue;
+        for (j = 0; j < count; j++) covered[GET_BE_WORD( record[j].axisIndex )] = TRUE;
+        if (!stat_add_label( labels, &label_count, ordering, value )) return FALSE;
+    }
+
+    for (i = 0; i < design_count; i++)
+    {
+        const struct tt_stat_axis_value *exact = NULL, *range = NULL, *single = NULL;
+        UINT format, candidates = 0;
+        INT32 coord = 0;
+
+        if (covered[i]) continue;
+        if (fvar_axis[i] >= 0) coord = var_get_coord( var, index, fvar_axis[i] );
+        for (k = 0; k < value_count; k++)
+        {
+            if (!(value = stat_get_axis_value( var, k ))) continue;
+            if ((format = GET_BE_WORD( value->format )) == 4 || GET_BE_WORD( value->axisIndex ) != i) continue;
+            candidates++;
+            single = value;
+            if (fvar_axis[i] < 0) continue;
+            /* the value of format 1 and 3, the nominal value of format 2 */
+            if ((INT32)GET_BE_DWORD( value->value ) == coord)
+            {
+                if (!exact) exact = value;
+            }
+            else if (format == 2 && !range && (INT32)GET_BE_DWORD( value->rangeMinValue ) <= coord &&
+                     coord <= (INT32)GET_BE_DWORD( value->rangeMaxValue ))
+                range = value;
+        }
+
+        if (fvar_axis[i] >= 0)
+        {
+            if (!(value = exact ? exact : range))
+            {
+                TRACE( "no STAT axis value for %s %#x\n", debugstr_fourcc( var->axes[fvar_axis[i]].axisTag ), coord );
+                return FALSE;
+            }
+        }
+        /* an axis that does not vary describes the whole font, e.g. the ital axis of an Italic font */
+        else if (candidates == 1) value = single;
+        else continue;
+        if (!stat_add_label( labels, &label_count, stat_axis_ordering( var, i ), value )) return FALSE;
+    }
+
+    for (i = 0; i < label_count; i++)
+    {
+        if (labels[i].flags & STAT_ELIDABLE_AXIS_VALUE_NAME) continue;
+        if (instance->label_count == ARRAY_SIZE(instance->label_name_ids)) return FALSE;
+        instance->label_name_ids[instance->label_count++] = labels[i].name_id;
+    }
+    return TRUE;
+}
+
+BOOL opentype_get_var_info( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                            struct opentype_var_info *info )
+{
+    struct opentype_var_font var;
+    UINT i;
+
+    if (!opentype_get_var_font( data, size, ttc_sfnt_v1, &var )) return FALSE;
+    if (var.instance_count < var.record_count)
+        WARN( "exposing only %u of %u named instances\n", var.instance_count, var.record_count );
+
+    info->instance_count = var.instance_count;
+    /* the first record at the default coordinates, like FreeType's default named instance */
+    info->default_instance = 0;
+    for (i = 1; i <= var.instance_count && !info->default_instance; i++)
+        if (var_coords_equal( &var, i, 0 )) info->default_instance = i;
+    return TRUE;
+}
+
+BOOL opentype_get_var_instance( const void *data, size_t size, const struct ttc_sfnt_v1 *ttc_sfnt_v1,
+                                UINT index, struct opentype_var_instance *instance )
+{
+    struct opentype_var_font var;
+    INT32 coord;
+    UINT i;
+
+    memset( instance, 0, sizeof(*instance) );
+    if (!opentype_get_var_font( data, size, ttc_sfnt_v1, &var )) return FALSE;
+    if (index > var.instance_count) return FALSE;
+
+    if (index) instance->subfamily_name_id = GET_BE_WORD( var_get_instance( &var, index )->subfamilyNameID );
+    instance->is_default = var_coords_equal( &var, index, 0 );
+    for (i = 1; i < index && !instance->is_duplicate; i++)
+        instance->is_duplicate = var_coords_equal( &var, index, i );
+
+    for (i = 0; i < var.axis_count; i++)
+    {
+        coord = var_get_coord( &var, index, i );
+        if (var.axes[i].axisTag == MS_WGHT_TAG)
+            instance->weight = min( max( ((INT64)coord + 0x8000) >> 16, 1 ), 1000 );
+        else if (var.axes[i].axisTag == MS_ITAL_TAG)
+        {
+            instance->has_slant_axis = TRUE;
+            if (coord >= 0x8000) instance->italic = TRUE;
+        }
+        else if (var.axes[i].axisTag == MS_SLNT_TAG)
+            instance->has_slant_axis = TRUE;
+    }
+
+    /* duplicate instances are not exposed, and need no name */
+    if (instance->is_duplicate) return TRUE;
+    if (!(instance->stat_valid = stat_get_instance_labels( &var, index, instance ))) instance->label_count = 0;
     return TRUE;
 }

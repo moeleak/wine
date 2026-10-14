@@ -568,15 +568,19 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
 
     windev = pop_dc_driver( dc, &window_driver );
 
+    if (surface && surface->alpha_mask) surface = &dummy_surface;
+
     if (surface)
     {
-        if (surface->alpha_mask) surface = &dummy_surface;
         if (windev) push_dc_driver( &dc->physDev, windev, windev->funcs );
         else
         {
             if (!window_driver.pCreateDC( &dc->physDev, NULL, NULL, NULL )) return;
             windev = find_dc_driver( dc, &window_driver );
         }
+
+        /* the pen, brush, font and clipping are realized again for the new scale by DC_InitDC */
+        dc->gdi_scale = get_window_surface_scale( surface );
 
         physdev = get_windrv_physdev( windev );
         window_surface_add_ref( surface );
@@ -599,6 +603,7 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
         }
         dibdrv->dib.rect = dc->attr->vis_rect;
         OffsetRect( &dibdrv->dib.rect, -dc->device_rect.left, -dc->device_rect.top );
+        dibdrv->dib.rect = scale_rect( dibdrv->dib.rect, dc->gdi_scale );
         dibdrv->bounds = &surface->bounds;
         DC_InitDC( dc );
     }
@@ -606,6 +611,7 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
     {
         dib_driver.pDeleteDC( pop_dc_driver( dc, &dib_driver ));
         windev->funcs->pDeleteDC( windev );
+        dc->gdi_scale = 1;
         DC_InitDC( dc );
     }
 }
@@ -937,11 +943,14 @@ static INT windrv_SetDIBitsToDevice( PHYSDEV dev, INT x_dst, INT y_dst, DWORD cx
 
 static void windrv_SetDeviceClipping( PHYSDEV dev, HRGN rgn )
 {
+    DC *dc = get_physdev_dc( dev );
+
     dev = GET_NEXT_PHYSDEV( dev, pSetDeviceClipping );
     dev->funcs->pSetDeviceClipping( dev, rgn );
-    /* also forward to the graphics driver for the OpenGL case */
+    /* also forward to the graphics driver for the OpenGL case, it expects device coordinates */
     if (dev->funcs == &dib_driver)
     {
+        if (dc->gdi_scale > 1) rgn = get_dc_region( dc );
         dev = GET_NEXT_PHYSDEV( dev, pSetDeviceClipping );
         dev->funcs->pSetDeviceClipping( dev, rgn );
     }

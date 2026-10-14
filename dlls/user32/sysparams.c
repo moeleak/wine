@@ -155,13 +155,28 @@ void release_display_dc( HDC hdc )
     LeaveCriticalSection( &display_dc_section );
 }
 
+static BOOL get_manifest_gdi_scaling(void)
+{
+    WCHAR buffer[16];
+
+    /* the null terminator is written even when the size doesn't account for it */
+    if (!QueryActCtxSettingsW( 0, NULL, L"http://schemas.microsoft.com/SMI/2017/WindowsSettings",
+                               L"gdiScaling", buffer, ARRAY_SIZE(buffer) - 1, NULL ))
+        return FALSE;
+
+    TRACE( "got gdiScaling=%s\n", debugstr_w(buffer) );
+    return !wcsicmp( buffer, L"true" );
+}
+
 /***********************************************************************
  *           SYSPARAMS_Init
  */
 void SYSPARAMS_Init(void)
 {
+    DPI_AWARENESS_CONTEXT unaware;
     WCHAR buffer[256];
     DWORD option;
+    BOOL gdi_scaling;
 
     system_dpi = NtUserGetSystemDpiForProcess( NULL );
 
@@ -175,6 +190,10 @@ void SYSPARAMS_Init(void)
             return;
         }
     }
+
+    /* gdiScaling only applies to DPI unaware processes */
+    gdi_scaling = get_manifest_gdi_scaling();
+    unaware = gdi_scaling ? DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED : DPI_AWARENESS_CONTEXT_UNAWARE;
 
     if (QueryActCtxSettingsW( 0, NULL, L"http://schemas.microsoft.com/SMI/2016/WindowsSettings",
                               L"dpiAwareness", buffer, ARRAY_SIZE(buffer), NULL ))
@@ -193,7 +212,7 @@ void SYSPARAMS_Init(void)
             for (i = 0; i < ARRAY_SIZE(types); i++)
             {
                 if (wcsicmp( start, types[i] )) continue;
-                SetProcessDpiAwarenessContext( (DPI_AWARENESS_CONTEXT)~i );
+                SetProcessDpiAwarenessContext( i ? (DPI_AWARENESS_CONTEXT)~i : unaware );
                 return;
             }
         }
@@ -207,8 +226,12 @@ void SYSPARAMS_Init(void)
         else if (!wcsicmp( buffer, L"true/pm" ) || !wcsicmp( buffer, L"per monitor" ))
             SetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE );
         else
-            SetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE );
+            SetProcessDpiAwarenessContext( unaware );
+        return;
     }
+
+    /* without a DPI awareness setting, the application can still change its DPI awareness */
+    if (gdi_scaling) NtUserSetDefaultProcessDpiAwarenessContext( NTUSER_DPI_PER_UNAWARE_GDISCALED );
 }
 
 static BOOL update_desktop_wallpaper(void)
