@@ -1197,7 +1197,7 @@ static HRESULT WINAPI VMR9WindowlessControl_GetNativeVideoSize(IVMRWindowlessCon
         LONG *width, LONG *height, LONG *aspect_width, LONG *aspect_height)
 {
     struct quartz_vmr *filter = impl_from_IVMRWindowlessControl9(iface);
-    const BITMAPINFOHEADER *bmiheader = get_filter_bitmap_header(filter);
+    const BITMAPINFOHEADER *bmiheader;
 
     TRACE("filter %p, width %p, height %p, aspect_width %p, aspect_height %p.\n",
             filter, width, height, aspect_width, aspect_height);
@@ -1205,6 +1205,11 @@ static HRESULT WINAPI VMR9WindowlessControl_GetNativeVideoSize(IVMRWindowlessCon
     if (!width || !height)
         return E_POINTER;
 
+    /* there is no video format without a connection */
+    if (!filter->renderer.sink.pin.peer)
+        return VFW_E_NOT_CONNECTED;
+
+    bmiheader = get_filter_bitmap_header(filter);
     *width = bmiheader->biWidth;
     *height = bmiheader->biHeight;
     if (aspect_width)
