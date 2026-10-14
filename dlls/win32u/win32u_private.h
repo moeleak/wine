@@ -200,6 +200,7 @@ extern RECT rect_thread_to_win_dpi( HWND hwnd, RECT rect );
 extern HMONITOR monitor_from_window( HWND hwnd, UINT flags, struct ratio dpi );
 extern MONITORINFO monitor_info_from_rect( RECT rect, struct ratio dpi );
 extern MONITORINFO monitor_info_from_window( HWND hwnd, UINT flags );
+extern BOOL get_fullscreen_letterbox_rect( RECT rect, struct ratio dpi, RECT *letterbox );
 extern struct ratio monitor_dpi_from_rect( RECT rect, struct ratio dpi, struct ratio *raw_dpi );
 extern BOOL update_display_cache( BOOL force );
 extern void reset_monitor_update_serial(void);

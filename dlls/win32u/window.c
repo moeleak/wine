@@ -2143,6 +2143,8 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     RECT visible_rect, rect = {0};
 
     if (get_present_rect( hwnd, &rect, get_thread_dpi() )) return rect;
+    /* cover the whole physical monitor, the window manager would resize the window to it anyway */
+    if (get_fullscreen_letterbox_rect( rects->window, get_thread_dpi(), &rect )) return rect;
     if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
     if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
     if (!adjust_window_rect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, round_dpi( dpi ) )) return rects->window;
@@ -2347,6 +2349,36 @@ static RECT get_surface_window_rect( struct window_surface *surface )
     return rect;
 }
 
+/* paint the parts of a letterboxed fullscreen window surface that the window doesn't cover in black */
+static void fill_letterbox_bars( struct window_surface *surface, const struct window_rects *rects )
+{
+    UINT scale = get_window_surface_scale( surface );
+    RECT window = rects->window, bars[4];
+    HDC hdc;
+    int i;
+
+    OffsetRect( &window, -rects->visible.left, -rects->visible.top );
+    window = scale_rect( window, scale );
+    SetRect( &bars[0], surface->rect.left, surface->rect.top, surface->rect.right, window.top );
+    SetRect( &bars[1], surface->rect.left, window.bottom, surface->rect.right, surface->rect.bottom );
+    SetRect( &bars[2], surface->rect.left, window.top, window.left, window.bottom );
+    SetRect( &bars[3], window.right, window.top, surface->rect.right, window.bottom );
+
+    hdc = NtGdiCreateCompatibleDC( 0 );
+    NtGdiSelectBitmap( hdc, surface->color_bitmap );
+    window_surface_lock( surface );
+    for (i = 0; i < ARRAY_SIZE(bars); i++)
+    {
+        if (IsRectEmpty( &bars[i] )) continue;
+        NtGdiPatBlt( hdc, bars[i].left, bars[i].top, bars[i].right - bars[i].left,
+                     bars[i].bottom - bars[i].top, BLACKNESS );
+        add_bounds_rect( &surface->bounds, &bars[i] );
+    }
+    window_surface_unlock( surface );
+    NtGdiDeleteObjectApp( hdc );
+    window_surface_flush( surface );
+}
+
 /***********************************************************************
  *           apply_window_pos
  *
@@ -2361,7 +2393,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     struct ratio raw_dpi, dpi = get_thread_dpi();
     BOOL ret, is_layered, is_child, need_icons = FALSE, rescaled = FALSE;
     struct window_rects old_rects;
-    RECT extra_rects[3];
+    RECT extra_rects[3], letterbox;
     struct window_surface *old_surface;
     HICON icon, icon_small;
     ICONINFO ii, ii_small;
@@ -2481,6 +2513,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     {
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
         register_window_surface( old_surface, new_surface );
+        if (new_surface && new_surface != old_surface && new_surface != &dummy_surface && !is_layered && !is_child &&
+            get_fullscreen_letterbox_rect( new_rects->window, dpi, &letterbox ) && EqualRect( &letterbox, &new_rects->visible ))
+            fill_letterbox_bars( new_surface, new_rects );
         if (old_surface)
         {
             if (valid_rects)

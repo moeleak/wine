@@ -4838,6 +4838,38 @@ MONITORINFO monitor_info_from_rect( RECT rect, struct ratio dpi )
     return info;
 }
 
+/* Rect of the whole physical monitor of a fullscreen window, when its monitor uses an emulated mode
+ * with another aspect ratio than the physical mode and the window would only cover a part of it. */
+BOOL get_fullscreen_letterbox_rect( RECT rect, struct ratio dpi, RECT *letterbox )
+{
+    struct monitor *monitor;
+    BOOL ret = FALSE;
+
+    if (!lock_display_devices( FALSE )) return FALSE;
+    if ((monitor = get_monitor_from_rect( rect, MONITOR_DEFAULTTONULL, dpi, MDT_DEFAULT )) && monitor->source &&
+        (monitor->source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
+    {
+        const DEVMODEW *physical = &monitor->source->physical;
+        RECT monitor_rect = monitor_get_rect( monitor, dpi, MDT_DEFAULT ), physical_rect, whole, intersect;
+
+        SetRect( &physical_rect, physical->dmPosition.x, physical->dmPosition.y,
+                 physical->dmPosition.x + physical->dmPelsWidth, physical->dmPosition.y + physical->dmPelsHeight );
+        whole = map_monitor_rect( monitor, physical_rect, no_dpi, MDT_RAW_DPI, dpi, MDT_DEFAULT );
+
+        if (rect.left <= monitor_rect.left && rect.top <= monitor_rect.top &&
+            rect.right >= monitor_rect.right && rect.bottom >= monitor_rect.bottom &&
+            intersect_rect( &intersect, &whole, &rect ) && EqualRect( &intersect, &rect ) &&
+            !EqualRect( &whole, &rect ))
+        {
+            *letterbox = whole;
+            ret = TRUE;
+        }
+    }
+    unlock_display_devices();
+
+    return ret;
+}
+
 struct ratio monitor_dpi_from_rect( RECT rect, struct ratio dpi, struct ratio *raw_dpi )
 {
     struct ratio ret = {system_dpi, 1}, x, y;
