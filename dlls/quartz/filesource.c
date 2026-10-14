@@ -47,7 +47,8 @@ struct request
 {
     IMediaSample *sample;
     DWORD_PTR cookie;
-    OVERLAPPED ovl;
+    LONGLONG offset;
+    DWORD size;
 };
 
 struct async_reader
@@ -60,8 +61,10 @@ struct async_reader
 
     LPOLESTR pszFileName;
     AM_MEDIA_TYPE mt;
-    HANDLE file, port, io_thread;
+    HANDLE file;
     LARGE_INTEGER file_size;
+    /* serializes the file pointer moves and reads, the file is read synchronously */
+    CRITICAL_SECTION file_cs;
     CRITICAL_SECTION sample_cs;
     BOOL flushing;
     struct request *requests;
@@ -319,19 +322,12 @@ static void async_reader_destroy(struct strmbase_filter *iface)
 
     if (filter->pszFileName)
     {
-        unsigned int i;
-
         if (filter->source.pin.peer)
             IPin_Disconnect(filter->source.pin.peer);
 
         IPin_Disconnect(&filter->source.pin.IPin_iface);
 
-        if (filter->requests)
-        {
-            for (i = 0; i < filter->max_requests; ++i)
-                CloseHandle(filter->requests[i].ovl.hEvent);
-            free(filter->requests);
-        }
+        free(filter->requests);
         CloseHandle(filter->file);
         strmbase_source_cleanup(&filter->source);
 
@@ -341,11 +337,8 @@ static void async_reader_destroy(struct strmbase_filter *iface)
 
     filter->sample_cs.DebugInfo->Spare[0] = 0;
     DeleteCriticalSection(&filter->sample_cs);
-
-    PostQueuedCompletionStatus(filter->port, 0, 1, NULL);
-    WaitForSingleObject(filter->io_thread, INFINITE);
-    CloseHandle(filter->io_thread);
-    CloseHandle(filter->port);
+    filter->file_cs.DebugInfo->Spare[0] = 0;
+    DeleteCriticalSection(&filter->file_cs);
 
     strmbase_filter_cleanup(&filter->filter);
     free(filter);
@@ -372,44 +365,6 @@ static const struct strmbase_filter_ops filter_ops =
     .filter_query_interface = async_reader_query_interface,
 };
 
-static DWORD CALLBACK io_thread(void *arg)
-{
-    struct async_reader *filter = arg;
-    struct request *req;
-    OVERLAPPED *ovl;
-    ULONG_PTR key;
-    DWORD size;
-    BOOL ret;
-
-    SetThreadDescription(GetCurrentThread(), L"wine_qz_async_reader_io");
-
-    for (;;)
-    {
-        ret = GetQueuedCompletionStatus(filter->port, &size, &key, &ovl, INFINITE);
-
-        if (ret && key)
-            break;
-
-        EnterCriticalSection(&filter->sample_cs);
-
-        req = CONTAINING_RECORD(ovl, struct request, ovl);
-        TRACE("Got sample %Iu.\n", req - filter->requests);
-        assert(req >= filter->requests && req < filter->requests + filter->max_requests);
-
-        if (ret)
-            WakeConditionVariable(&filter->sample_cv);
-        else
-        {
-            ERR("GetQueuedCompletionStatus() returned failure, error %lu.\n", GetLastError());
-            req->sample = NULL;
-        }
-
-        LeaveCriticalSection(&filter->sample_cs);
-    }
-
-    return 0;
-}
-
 HRESULT async_reader_create(IUnknown *outer, IUnknown **out)
 {
     struct async_reader *object;
@@ -424,9 +379,9 @@ HRESULT async_reader_create(IUnknown *outer, IUnknown **out)
 
     InitializeCriticalSectionEx(&object->sample_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
     object->sample_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": FileAsyncReader.sample_cs");
+    InitializeCriticalSectionEx(&object->file_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+    object->file_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": FileAsyncReader.file_cs");
     InitializeConditionVariable(&object->sample_cv);
-    object->port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
-    object->io_thread = CreateThread(NULL, 0, io_thread, object, 0, NULL);
 
     TRACE("Created file source %p.\n", object);
     *out = &object->filter.IUnknown_inner;
@@ -464,18 +419,25 @@ static HRESULT WINAPI FileSource_Load(IFileSourceFilter * iface, LPCOLESTR pszFi
 
     /* open file */
     /* FIXME: check the sharing values that native uses */
-    hFile = CreateFileW(pszFileName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    /* Use synchronous I/O and GetFileSize(), presumably like native: some applications hook these
+     * file functions to provide the data from memory, work on Windows, and don't handle
+     * overlapped reads or GetFileSizeEx(). */
+    hFile = CreateFileW(pszFileName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
 
     if (hFile == INVALID_HANDLE_VALUE)
     {
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
-    if (!GetFileSizeEx(hFile, &This->file_size))
+    SetLastError(NO_ERROR);
+    This->file_size.LowPart = GetFileSize(hFile, (DWORD *)&This->file_size.HighPart);
+    if (This->file_size.LowPart == INVALID_FILE_SIZE && GetLastError() != NO_ERROR)
     {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+
         WARN("Could not get file size.\n");
         CloseHandle(hFile);
-        return HRESULT_FROM_WIN32(GetLastError());
+        return hr;
     }
 
     if (This->pszFileName)
@@ -658,7 +620,6 @@ static HRESULT WINAPI FileAsyncReader_RequestAllocator(IAsyncReader *iface,
 {
     struct async_reader *filter = impl_from_IAsyncReader(iface);
     IMemAllocator *allocator;
-    unsigned int i;
     HRESULT hr;
 
     TRACE("filter %p, preferred %p, props %p, ret_allocator %p.\n", filter, preferred, props, ret_allocator);
@@ -680,12 +641,7 @@ static HRESULT WINAPI FileAsyncReader_RequestAllocator(IAsyncReader *iface,
         return hr;
     }
 
-    if (filter->requests)
-    {
-        for (i = 0; i < filter->max_requests; ++i)
-            CloseHandle(filter->requests[i].ovl.hEvent);
-        free(filter->requests);
-    }
+    free(filter->requests);
 
     filter->max_requests = props->cBuffers;
     TRACE("Maximum request count: %u.\n", filter->max_requests);
@@ -695,11 +651,35 @@ static HRESULT WINAPI FileAsyncReader_RequestAllocator(IAsyncReader *iface,
         return E_OUTOFMEMORY;
     }
 
-    for (i = 0; i < filter->max_requests; ++i)
-        filter->requests[i].ovl.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-
     *ret_allocator = allocator;
     return S_OK;
+}
+
+static BOOL sync_read(struct async_reader *filter, LONGLONG offset, LONG length, BYTE *buffer, DWORD *read_len)
+{
+    LONG high = offset >> 32;
+    BOOL ret;
+
+    *read_len = 0;
+
+    /* Use SetFilePointer(), some hooks implement SetFilePointerEx() as if it returned
+     * the new position. Only pass the high part when needed, for the same reason. */
+    EnterCriticalSection(&filter->file_cs);
+    SetLastError(NO_ERROR);
+    if ((ret = SetFilePointer(filter->file, (LONG)offset, offset >> 31 ? &high : NULL, FILE_BEGIN)
+            != INVALID_SET_FILE_POINTER || GetLastError() == NO_ERROR))
+        ret = ReadFile(filter->file, buffer, length, read_len, NULL);
+    LeaveCriticalSection(&filter->file_cs);
+
+    /* a read starting at or after the end of the file fails, as it would for an overlapped read */
+    if (ret && !*read_len && length)
+    {
+        SetLastError(ERROR_HANDLE_EOF);
+        ret = FALSE;
+    }
+
+    TRACE("Returning %lu bytes.\n", *read_len);
+    return ret;
 }
 
 static HRESULT WINAPI FileAsyncReader_Request(IAsyncReader *iface, IMediaSample *sample, DWORD_PTR cookie)
@@ -740,16 +720,15 @@ static HRESULT WINAPI FileAsyncReader_Request(IAsyncReader *iface, IMediaSample 
     assert(i < filter->max_requests);
     req = &filter->requests[i];
 
-    req->ovl.Offset = BYTES_FROM_MEDIATIME(start);
-    req->ovl.OffsetHigh = BYTES_FROM_MEDIATIME(start) >> 32;
-    /* No reference is taken. */
-
-    if (ReadFile(filter->file, data, BYTES_FROM_MEDIATIME(end - start), NULL, &req->ovl)
-            || GetLastError() == ERROR_IO_PENDING)
+    /* The request is completed synchronously, WaitForNext() returns it. */
+    req->offset = BYTES_FROM_MEDIATIME(start);
+    if (sync_read(filter, req->offset, BYTES_FROM_MEDIATIME(end - start), data, &req->size))
     {
         hr = S_OK;
+        /* No reference is taken. */
         req->sample = sample;
         req->cookie = cookie;
+        WakeAllConditionVariable(&filter->sample_cv);
     }
     else
         hr = HRESULT_FROM_WIN32(GetLastError());
@@ -782,15 +761,14 @@ static HRESULT WINAPI FileAsyncReader_WaitForNext(IAsyncReader *iface,
         for (i = 0; i < filter->max_requests; ++i)
         {
             struct request *req = &filter->requests[i];
-            DWORD size;
 
-            if (req->sample && GetOverlappedResult(filter->file, &req->ovl, &size, FALSE))
+            if (req->sample)
             {
                 REFERENCE_TIME start, end;
 
-                IMediaSample_SetActualDataLength(req->sample, size);
-                start = MEDIATIME_FROM_BYTES(((ULONGLONG)req->ovl.OffsetHigh << 32) + req->ovl.Offset);
-                end = start + MEDIATIME_FROM_BYTES(size);
+                IMediaSample_SetActualDataLength(req->sample, req->size);
+                start = MEDIATIME_FROM_BYTES(req->offset);
+                end = start + MEDIATIME_FROM_BYTES(req->size);
                 IMediaSample_SetTime(req->sample, &start, &end);
 
                 *sample = req->sample;
@@ -806,27 +784,6 @@ static HRESULT WINAPI FileAsyncReader_WaitForNext(IAsyncReader *iface,
 
     LeaveCriticalSection(&filter->sample_cs);
     return VFW_E_TIMEOUT;
-}
-
-static BOOL sync_read(HANDLE file, LONGLONG offset, LONG length, BYTE *buffer, DWORD *read_len)
-{
-    OVERLAPPED ovl = {0};
-    BOOL ret;
-
-    ovl.hEvent = (HANDLE)((ULONG_PTR)CreateEventW(NULL, TRUE, FALSE, NULL) | 1);
-    ovl.Offset = (DWORD)offset;
-    ovl.OffsetHigh = offset >> 32;
-
-    *read_len = 0;
-
-    ret = ReadFile(file, buffer, length, NULL, &ovl);
-    if (ret || GetLastError() == ERROR_IO_PENDING)
-        ret = GetOverlappedResult(file, &ovl, read_len, TRUE);
-
-    TRACE("Returning %lu bytes.\n", *read_len);
-
-    CloseHandle(ovl.hEvent);
-    return ret;
 }
 
 static HRESULT WINAPI FileAsyncReader_SyncReadAligned(IAsyncReader *iface, IMediaSample *sample)
@@ -849,7 +806,7 @@ static HRESULT WINAPI FileAsyncReader_SyncReadAligned(IAsyncReader *iface, IMedi
     if (SUCCEEDED(hr))
     {
         length = BYTES_FROM_MEDIATIME(end_time - start_time);
-        ret = sync_read(filter->file, BYTES_FROM_MEDIATIME(start_time), length, buffer, &read_len);
+        ret = sync_read(filter, BYTES_FROM_MEDIATIME(start_time), length, buffer, &read_len);
         if (ret)
             hr = (read_len == length) ? S_OK : S_FALSE;
         else if (GetLastError() == ERROR_HANDLE_EOF)
@@ -874,7 +831,7 @@ static HRESULT WINAPI FileAsyncReader_SyncRead(IAsyncReader *iface,
 
     TRACE("filter %p, offset %#I64x, length %ld, buffer %p.\n", filter, offset, length, buffer);
 
-    ret = sync_read(filter->file, offset, length, buffer, &read_len);
+    ret = sync_read(filter, offset, length, buffer, &read_len);
     if (ret)
         hr = (read_len == length) ? S_OK : S_FALSE;
     else if (GetLastError() == ERROR_HANDLE_EOF)
@@ -908,7 +865,6 @@ static HRESULT WINAPI FileAsyncReader_BeginFlush(IAsyncReader * iface)
     filter->flushing = TRUE;
     for (i = 0; i < filter->max_requests; ++i)
         filter->requests[i].sample = NULL;
-    CancelIoEx(filter->file, NULL);
     WakeAllConditionVariable(&filter->sample_cv);
 
     LeaveCriticalSection(&filter->sample_cs);
